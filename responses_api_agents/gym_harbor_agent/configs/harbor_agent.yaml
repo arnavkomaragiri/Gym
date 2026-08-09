@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+gym_harbor_agent:
+  responses_api_agents:
+    gym_harbor_agent:
+      entrypoint: app.py
+      domain: agent
+      token_id_capture: true
+
+      jobs_dir: ${oc.env:RAY_TMPDIR,/tmp}/gym_harbor_agent_jobs
+
+      # Follows harbor.models.job.config.DatasetConfig.
+      dataset:
+        path: ${oc.env:HOME}/store/data/edison/harbor-bbh/val
+
+      # OpenCode's OpenAI provider is routed through the Gym policy model.
+      agent:
+        name: opencode
+        model_name: openai/${policy_model_name}
+        env: {}
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      model_base_url_env_var: OPENAI_BASE_URL
+      model_api_key_env_var: OPENAI_API_KEY
+      model_api_key: ${policy_api_key}
+
+      # Follows harbor.models.trial.config.EnvironmentConfig.
+      environment:
+        type: docker

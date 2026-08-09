@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[project]
+name = "gym-harbor-agent"
+version = "0.0.0"
+requires-python = ">=3.13.14,<3.14"
+dependencies = [
+    "nemo-gym[dev]",
+    "harbor>=0.20.0",
+]
+
+[build-system]
+build-backend = "setuptools.build_meta"
+requires = ["setuptools>=61"]
+
+[tool.setuptools.packages.find]
+where = ["../.."]
+include = ["responses_api_agents.gym_harbor_agent*"]
+
+[tool.uv.sources]
+nemo-gym = { path = "../..", editable = true }
+
+[tool.uv]
+# Harbor and Gym declare incompatible litellm constraints, but OpenCode owns
+# its provider client and this server does not import litellm directly.
+override-dependencies = ["litellm"]
