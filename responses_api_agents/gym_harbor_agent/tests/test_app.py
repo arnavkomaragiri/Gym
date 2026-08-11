@@ -2,6 +2,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from harbor.models.trial.config import AgentConfig
+from omegaconf import OmegaConf
 
 from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
 from responses_api_agents.gym_harbor_agent.app import (
@@ -97,3 +98,29 @@ def test_nrl_rollout_id_routes_to_prefixed_gym_model_url(tmp_path: Path) -> None
 
     assert rollout_id == "nrl-step7-sample3"
     assert base_url == "http://model-host:9000/ng-rollout/nrl-step7-sample3/v1"
+
+
+def test_opensandbox_config_separates_requests_from_limits(monkeypatch) -> None:
+    gym_root = Path(__file__).resolve().parents[3]
+    dataset_path = "/datasets/bbh-harbor-rl-v0/val"
+    monkeypatch.setenv("HARBOR_DATASET_PATH", dataset_path)
+    monkeypatch.setenv("OPENSANDBOX_API_KEY", "test-key")
+    monkeypatch.setenv("OPENSANDBOX_PROTOCOL", "https")
+    monkeypatch.setenv("OPENSANDBOX_USE_SERVER_PROXY", "false")
+
+    config = OmegaConf.merge(
+        OmegaConf.load(gym_root / "nemo_gym/sandbox/providers/opensandbox/configs/opensandbox.yaml"),
+        OmegaConf.load(gym_root / "responses_api_agents/gym_harbor_agent/configs/harbor_agent.yaml"),
+        OmegaConf.load(gym_root / "responses_api_agents/gym_harbor_agent/configs/harbor_agent_opensandbox.yaml"),
+    )
+    agent_config = config.gym_harbor_agent.responses_api_agents.gym_harbor_agent
+    environment = OmegaConf.to_container(agent_config.environment, resolve=True)
+
+    assert OmegaConf.to_container(agent_config.dataset, resolve=True)["path"] == dataset_path
+    assert environment["import_path"].endswith(":NemoGymSandboxEnvironment")
+    assert environment["override_cpus"] == 4
+    assert environment["override_memory_mb"] == 65536
+    assert environment["kwargs"]["sandbox_provider_options"] == {"resource_requests": {"cpu": 0.25, "memory_mib": 512}}
+    assert environment["kwargs"]["sandbox_provider"]["opensandbox"]["connection"]["api_key"] == "test-key"
+    assert environment["kwargs"]["sandbox_provider"]["opensandbox"]["connection"]["protocol"] == "https"
+    assert environment["kwargs"]["sandbox_provider"]["opensandbox"]["connection"]["use_server_proxy"] is False

@@ -1,0 +1,35 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Layer this after harbor_agent.yaml and the OpenSandbox provider config.
+# HARBOR_DATASET_PATH must point at a materialized Harbor dataset.
+sandbox:
+  opensandbox:
+    connection:
+      protocol: ${oc.env:OPENSANDBOX_PROTOCOL,http}
+      use_server_proxy: ${oc.decode:${oc.env:OPENSANDBOX_USE_SERVER_PROXY,true}}
+
+gym_harbor_agent:
+  responses_api_agents:
+    gym_harbor_agent:
+      dataset:
+        path: ${oc.env:HARBOR_DATASET_PATH}
+
+      environment:
+        type: null
+        import_path: responses_api_agents.harbor_agent.custom_envs.nemo_gym_sandbox.environment:NemoGymSandboxEnvironment
+        cpu_enforcement_policy: limit
+        memory_enforcement_policy: limit
+        override_cpus: 4
+        override_memory_mb: 65536
+        kwargs:
+          sandbox_provider: ${sandbox}
+          sandbox_provider_options:
+            resource_requests:
+              cpu: 0.25
+              memory_mib: 512
+          sandbox_metadata:
+            harbor-benchmark: ${oc.env:HARBOR_BENCHMARK_NAME,harbor}
+          sandbox_ttl_s: 7200
+          sandbox_ready_timeout_s: 1200
+          default_exec_timeout_s: 3600

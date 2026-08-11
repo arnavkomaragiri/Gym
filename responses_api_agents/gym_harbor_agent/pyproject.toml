@@ -8,6 +8,8 @@ requires-python = ">=3.13.14,<3.14"
 dependencies = [
     "nemo-gym[dev]",
     "harbor>=0.20.0",
+    "opensandbox>=0.1.15",
+    "tenacity>=9.1.4",
 ]
 
 [build-system]

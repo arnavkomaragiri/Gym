@@ -37,6 +37,7 @@ from typing import Any, Mapping, Optional
 
 from harbor.environments.base import BaseEnvironment, ExecResult
 from harbor.models.environment_type import EnvironmentType
+from harbor.models.task.config import NetworkMode
 from harbor.models.trial.paths import EnvironmentPaths
 
 from nemo_gym.sandbox import (
@@ -109,7 +110,7 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
         workdir: Container working directory override (defaults to the image's
             own WORKDIR).
         allow_unenforced_internet_isolation: Accept tasks that request
-            ``allow_internet = false`` even though this environment cannot
+            ``network_mode = "no-network"`` even though this environment cannot
             enforce network isolation (default False). Each affected trial
             logs a prominent warning.
     """
@@ -181,15 +182,6 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
                 "NemoGymSandboxEnvironment cannot build images from a Dockerfile."
             )
 
-    def _validate_internet_config(self):
-        if not self.task_env_config.allow_internet and not self.can_disable_internet:
-            raise ValueError(
-                f"Task {self.environment_name!r} requires allow_internet=false, which "
-                "NemoGymSandboxEnvironment cannot enforce. Set "
-                "harbor_environment_kwargs.allow_unenforced_internet_isolation=true to run "
-                "the task anyway (without isolation)."
-            )
-
     @property
     def _resolved_image(self) -> str:
         return rewrite_image(self.task_env_config.docker_image, self._image_rewrites)
@@ -230,9 +222,9 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
                 "force_build is not supported by NemoGymSandboxEnvironment; using the task's prebuilt image %r.",
                 self._resolved_image,
             )
-        if not self.task_env_config.allow_internet:
+        if self._network_policy.network_mode == NetworkMode.NO_NETWORK:
             self.logger.warning(
-                "Task %r requests allow_internet=false but NemoGymSandboxEnvironment does "
+                "Task %r requests network_mode='no-network' but NemoGymSandboxEnvironment does "
                 "not enforce network isolation; the sandbox keeps cluster-default egress.",
                 self.environment_name,
             )

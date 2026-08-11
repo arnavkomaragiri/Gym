@@ -18,6 +18,7 @@ from typing import Optional
 
 import pytest
 from harbor.models.task.config import EnvironmentConfig as TaskEnvironmentConfig
+from harbor.models.task.config import NetworkMode, NetworkPolicy
 from harbor.models.trial.paths import TrialPaths
 
 from nemo_gym.sandbox import SandboxExecResult, SandboxHandle, SandboxSpec, SandboxStatus, register_provider
@@ -129,13 +130,17 @@ class TestValidation:
             _make_environment(tmp_path, task_env_config=TaskEnvironmentConfig(docker_image=None))
 
     def test_rejects_internet_isolation_by_default(self, tmp_path):
-        config = TaskEnvironmentConfig(docker_image="example/task:1.0", allow_internet=False)
-        with pytest.raises(ValueError, match="allow_internet"):
-            _make_environment(tmp_path, task_env_config=config)
+        policy = NetworkPolicy(network_mode=NetworkMode.NO_NETWORK)
+        with pytest.raises(ValueError, match="no-network"):
+            _make_environment(tmp_path, network_policy=policy)
 
     def test_internet_isolation_opt_in(self, tmp_path):
-        config = TaskEnvironmentConfig(docker_image="example/task:1.0", allow_internet=False)
-        env = _make_environment(tmp_path, task_env_config=config, allow_unenforced_internet_isolation=True)
+        policy = NetworkPolicy(network_mode=NetworkMode.NO_NETWORK)
+        env = _make_environment(
+            tmp_path,
+            network_policy=policy,
+            allow_unenforced_internet_isolation=True,
+        )
         assert env.can_disable_internet is True
 
 
@@ -289,9 +294,9 @@ class TestExec:
         assert _provider().exec_calls[-1]["command"] == "true"
 
     @pytest.mark.asyncio
-    async def test_exec_cpu_pin_width_tracks_task_cpu_default(self, tmp_path):
-        # Harbor defaults EnvironmentConfig.cpus to 1, so a task without an
-        # explicit cpu count pins with width 1 (matching its cgroup limit).
+    async def test_exec_cpu_pin_skips_unspecified_task_cpu(self, tmp_path):
+        # Harbor 0.20 leaves an unspecified CPU count as None. Without a known
+        # cgroup limit, there is no meaningful affinity width to apply.
         env = _make_environment(
             tmp_path,
             exec_shell=None,
@@ -301,8 +306,7 @@ class TestExec:
         await env.start(force_build=False)
         await env.exec("true")
         command = _provider().exec_calls[-1]["command"]
-        assert command.startswith("__osb_w=1; ")
-        assert command.endswith("$__osb_pin true")
+        assert command == "true"
 
     def test_cpu_pin_prefix_is_valid_posix_sh(self):
         import shutil
