@@ -18,6 +18,7 @@ import asyncio
 import logging
 import re
 import shlex
+import ssl
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
@@ -364,6 +365,8 @@ class OpenSandboxConnectionConfig:
     protocol: str | None = None
     request_timeout_s: int | None = None
     use_server_proxy: bool = False
+    # Additional CA certificates trusted only by this provider's HTTP transport.
+    ca_bundle_path: str | None = None
     # Open a fresh connection per request. Set this behind a load balancer that
     # silently reaps idle pooled connections, where reusing one hangs the SDK.
     # Costs a handshake per request; otherwise harmless.
@@ -627,7 +630,11 @@ class OpenSandboxProvider:
             kwargs["request_timeout"] = timedelta(seconds=request_timeout_s)
         if self._connection.use_server_proxy:
             kwargs["use_server_proxy"] = True
-        if self._connection.keepalive_expiry_s is not None or self._connection.disable_connection_pooling:
+        if (
+            self._connection.keepalive_expiry_s is not None
+            or self._connection.disable_connection_pooling
+            or self._connection.ca_bundle_path is not None
+        ):
             kwargs["transport"] = self._get_transport()
         return ConnectionConfig(**kwargs)
 
@@ -649,7 +656,12 @@ class OpenSandboxProvider:
             max_keepalive_connections=max_keepalive,
             keepalive_expiry=self._connection.keepalive_expiry_s,
         )
-        if self._connection.transport_backend == "aiohttp":
+        ssl_context: ssl.SSLContext | bool = True
+        if self._connection.ca_bundle_path is not None:
+            ssl_context = ssl.create_default_context()
+            ssl_context.load_verify_locations(cafile=self._connection.ca_bundle_path)
+
+        if self._connection.transport_backend == "aiohttp" and self._connection.ca_bundle_path is None:
             try:
                 from httpx_aiohttp import AiohttpTransport
 
@@ -659,7 +671,15 @@ class OpenSandboxProvider:
                     "connection.transport_backend=aiohttp requested but httpx-aiohttp "
                     "is not installed; falling back to the httpx transport"
                 )
-        return httpx.AsyncHTTPTransport(limits=limits, retries=self._connection.connect_retries)
+        elif self._connection.transport_backend == "aiohttp":
+            LOGGER.warning(
+                "connection.ca_bundle_path requires the httpx transport; ignoring connection.transport_backend=aiohttp"
+            )
+        return httpx.AsyncHTTPTransport(
+            verify=ssl_context,
+            limits=limits,
+            retries=self._connection.connect_retries,
+        )
 
     async def aclose(self) -> None:
         """Close provider-owned resources."""

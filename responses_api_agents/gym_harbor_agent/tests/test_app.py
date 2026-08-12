@@ -107,6 +107,12 @@ def test_opensandbox_config_separates_requests_from_limits(monkeypatch) -> None:
     monkeypatch.setenv("OPENSANDBOX_API_KEY", "test-key")
     monkeypatch.setenv("OPENSANDBOX_PROTOCOL", "https")
     monkeypatch.setenv("OPENSANDBOX_USE_SERVER_PROXY", "false")
+    monkeypatch.setenv("OPENSANDBOX_CA_BUNDLE", "/certs/opensandbox.pem")
+    monkeypatch.setenv("HARBOR_IMAGE_OVERRIDE", "docker.io/example/task@sha256:1234")
+    monkeypatch.setenv(
+        "HARBOR_SANDBOX_ENTRYPOINT",
+        '["sh", "/opt/entrypoint.sh", "tail", "-f", "/dev/null"]',
+    )
 
     config = OmegaConf.merge(
         OmegaConf.load(gym_root / "nemo_gym/sandbox/providers/opensandbox/configs/opensandbox.yaml"),
@@ -124,3 +130,15 @@ def test_opensandbox_config_separates_requests_from_limits(monkeypatch) -> None:
     assert environment["kwargs"]["sandbox_provider"]["opensandbox"]["connection"]["api_key"] == "test-key"
     assert environment["kwargs"]["sandbox_provider"]["opensandbox"]["connection"]["protocol"] == "https"
     assert environment["kwargs"]["sandbox_provider"]["opensandbox"]["connection"]["use_server_proxy"] is False
+    assert (
+        environment["kwargs"]["sandbox_provider"]["opensandbox"]["connection"]["ca_bundle_path"]
+        == "/certs/opensandbox.pem"
+    )
+    assert environment["kwargs"]["image_override"] == "docker.io/example/task@sha256:1234"
+    assert environment["kwargs"]["entrypoint"] == [
+        "sh",
+        "/opt/entrypoint.sh",
+        "tail",
+        "-f",
+        "/dev/null",
+    ]

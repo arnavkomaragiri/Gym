@@ -197,6 +197,18 @@ class TestStartStop:
         assert _provider().created_specs[0].image == "mirror.example.com/example/task:1.0"
 
     @pytest.mark.asyncio
+    async def test_start_applies_image_and_entrypoint_overrides(self, tmp_path):
+        env = _make_environment(
+            tmp_path,
+            image_override="docker.io/example/replacement@sha256:1234",
+            entrypoint=["sh", "/opt/entrypoint.sh", "tail", "-f", "/dev/null"],
+        )
+        await env.start(force_build=False)
+        spec = _provider().created_specs[0]
+        assert spec.image == "docker.io/example/replacement@sha256:1234"
+        assert spec.entrypoint == ["sh", "/opt/entrypoint.sh", "tail", "-f", "/dev/null"]
+
+    @pytest.mark.asyncio
     async def test_stop_always_kills_sandbox(self, tmp_path):
         env = _make_environment(tmp_path)
         await env.start(force_build=False)

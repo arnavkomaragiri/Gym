@@ -400,6 +400,45 @@ def test_connection_transport_backends(fake_opensandbox_sdk: None, monkeypatch: 
     assert transport._pool._max_keepalive_connections == 0
 
 
+def test_connection_custom_ca_bundle_is_scoped_to_httpx_transport(
+    fake_opensandbox_sdk: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    ca_bundle = tmp_path / "opensandbox-ca.pem"
+    ca_bundle.write_text("test CA")
+
+    class FakeSSLContext:
+        loaded_cafile: str | None = None
+
+        def load_verify_locations(self, *, cafile: str) -> None:
+            self.loaded_cafile = cafile
+
+    class FakeTransport:
+        async def aclose(self) -> None:
+            pass
+
+    ssl_context = FakeSSLContext()
+    transport_kwargs: dict[str, Any] = {}
+
+    def make_transport(**kwargs: Any) -> FakeTransport:
+        transport_kwargs.update(kwargs)
+        return FakeTransport()
+
+    monkeypatch.setattr(opensandbox_provider.ssl, "create_default_context", lambda: ssl_context)
+    monkeypatch.setattr(httpx, "AsyncHTTPTransport", make_transport)
+
+    provider = opensandbox_provider.OpenSandboxProvider(
+        connection={
+            "ca_bundle_path": str(ca_bundle),
+            "keepalive_expiry_s": None,
+        }
+    )
+    transport = provider._connection_config().kwargs["transport"]
+
+    assert isinstance(transport, FakeTransport)
+    assert transport_kwargs["verify"] is ssl_context
+    assert ssl_context.loaded_cafile == str(ca_bundle)
+
+
 async def test_connection_transport_is_shared_and_closed_by_provider(fake_opensandbox_sdk: None) -> None:
     # The SDK never closes a transport it did not create, so the provider owns
     # one: built on first use, reused by every ConnectionConfig rather than

@@ -8,6 +8,7 @@ sandbox:
     connection:
       protocol: ${oc.env:OPENSANDBOX_PROTOCOL,http}
       use_server_proxy: ${oc.decode:${oc.env:OPENSANDBOX_USE_SERVER_PROXY,true}}
+      ca_bundle_path: ${oc.env:OPENSANDBOX_CA_BUNDLE,null}
 
 gym_harbor_agent:
   responses_api_agents:
@@ -24,6 +25,8 @@ gym_harbor_agent:
         override_memory_mb: 65536
         kwargs:
           sandbox_provider: ${sandbox}
+          image_override: ${oc.env:HARBOR_IMAGE_OVERRIDE,null}
+          entrypoint: ${oc.decode:${oc.env:HARBOR_SANDBOX_ENTRYPOINT,null}}
           sandbox_provider_options:
             resource_requests:
               cpu: 0.25

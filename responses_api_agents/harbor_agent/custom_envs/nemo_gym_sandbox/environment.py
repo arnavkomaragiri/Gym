@@ -107,6 +107,10 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
         image_rewrites: Ordered ``[{from: ..., to: ...}]`` prefix rewrites
             applied to the task's ``docker_image`` (see
             ``nemo_gym.sandbox.rewrite_image``).
+        image_override: Optional image replacing the task's ``docker_image``.
+            Prefer a digest-pinned reference for reproducible runs.
+        entrypoint: Optional command replacing the sandbox image's startup
+            command. This is useful when Harbor starts task services later.
         workdir: Container working directory override (defaults to the image's
             own WORKDIR).
         allow_unenforced_internet_isolation: Accept tasks that request
@@ -128,6 +132,8 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
         exec_shell: Optional[str] = "bash -ic",
         cpu_pin_enabled: bool = False,
         image_rewrites: Optional[list[Mapping[str, str]]] = None,
+        image_override: Optional[str] = None,
+        entrypoint: Optional[list[str]] = None,
         workdir: Optional[str] = None,
         allow_unenforced_internet_isolation: bool = False,
         **kwargs,
@@ -144,6 +150,8 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
         self._exec_shell = exec_shell
         self._cpu_pin_enabled = cpu_pin_enabled
         self._image_rewrites = [dict(rewrite) for rewrite in (image_rewrites or [])]
+        self._image_override = image_override
+        self._entrypoint = list(entrypoint) if entrypoint is not None else None
         self._workdir = workdir
         self._allow_unenforced_internet_isolation = allow_unenforced_internet_isolation
         self._sandbox: Optional[AsyncSandbox] = None
@@ -184,6 +192,8 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
 
     @property
     def _resolved_image(self) -> str:
+        if self._image_override is not None:
+            return self._image_override
         return rewrite_image(self.task_env_config.docker_image, self._image_rewrites)
 
     def _build_spec(self) -> SandboxSpec:
@@ -213,6 +223,7 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
             env=self._sandbox_env,
             metadata=metadata,
             resources=resources,
+            entrypoint=self._entrypoint,
             provider_options=dict(self._sandbox_provider_options),
         )
 
