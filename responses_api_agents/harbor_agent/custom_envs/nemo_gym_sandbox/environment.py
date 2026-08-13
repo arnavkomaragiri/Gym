@@ -219,8 +219,8 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
             image=self._resolved_image,
             ttl_s=self._sandbox_ttl_s,
             ready_timeout_s=self._sandbox_ready_timeout_s,
-            workdir=self._workdir,
-            env=self._sandbox_env,
+            workdir=self._workdir if self._workdir is not None else self.task_env_config.workdir,
+            env={**self._startup_env(), **self._sandbox_env},
             metadata=metadata,
             resources=resources,
             entrypoint=self._entrypoint,
@@ -255,6 +255,7 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
             raise RuntimeError(
                 f"Failed to create log directories in sandbox: {result.stderr or result.stdout or '<no output>'}"
             )
+        await self._upload_environment_dir_after_start()
 
     def _require_sandbox(self) -> AsyncSandbox:
         if self._sandbox is None:
@@ -292,7 +293,7 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
         result = await self._require_sandbox().exec(
             command,
             cwd=cwd,
-            env=env,
+            env=self._merge_env(env),
             timeout_s=timeout_s,
         )
         return ExecResult(

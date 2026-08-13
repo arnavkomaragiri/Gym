@@ -9,6 +9,15 @@ sandbox:
       protocol: ${oc.env:OPENSANDBOX_PROTOCOL,http}
       use_server_proxy: ${oc.decode:${oc.env:OPENSANDBOX_USE_SERVER_PROXY,true}}
       ca_bundle_path: ${oc.env:OPENSANDBOX_CA_BUNDLE,null}
+    # Image-specific readiness can warm lazy-pulled files before Harbor's
+    # shorter task setup timeout begins.
+    probe:
+      command: ${oc.env:HARBOR_SANDBOX_PROBE_COMMAND,printf nemo-gym-sandbox-ready}
+      expected_stdout: ${oc.env:HARBOR_SANDBOX_PROBE_EXPECTED_STDOUT,nemo-gym-sandbox-ready}
+      timeout_s: ${oc.decode:${oc.env:HARBOR_SANDBOX_PROBE_TIMEOUT_S,30}}
+      deadline_s: ${oc.decode:${oc.env:HARBOR_SANDBOX_PROBE_DEADLINE_S,null}}
+      stable_count: ${oc.decode:${oc.env:HARBOR_SANDBOX_PROBE_STABLE_COUNT,1}}
+      stable_delay_s: ${oc.decode:${oc.env:HARBOR_SANDBOX_PROBE_STABLE_DELAY_S,0.0}}
 
 gym_harbor_agent:
   responses_api_agents:

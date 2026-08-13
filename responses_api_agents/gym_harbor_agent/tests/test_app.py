@@ -113,6 +113,15 @@ def test_opensandbox_config_separates_requests_from_limits(monkeypatch) -> None:
         "HARBOR_SANDBOX_ENTRYPOINT",
         '["sh", "/opt/entrypoint.sh", "tail", "-f", "/dev/null"]',
     )
+    monkeypatch.setenv(
+        "HARBOR_SANDBOX_PROBE_COMMAND",
+        "python -c \"import bbh_mcp.server; print('nemo-gym-sandbox-ready')\"",
+    )
+    monkeypatch.setenv("HARBOR_SANDBOX_PROBE_EXPECTED_STDOUT", "nemo-gym-sandbox-ready")
+    monkeypatch.setenv("HARBOR_SANDBOX_PROBE_TIMEOUT_S", "180")
+    monkeypatch.setenv("HARBOR_SANDBOX_PROBE_DEADLINE_S", "240")
+    monkeypatch.setenv("HARBOR_SANDBOX_PROBE_STABLE_COUNT", "1")
+    monkeypatch.setenv("HARBOR_SANDBOX_PROBE_STABLE_DELAY_S", "0")
 
     config = OmegaConf.merge(
         OmegaConf.load(gym_root / "nemo_gym/sandbox/providers/opensandbox/configs/opensandbox.yaml"),
@@ -142,3 +151,11 @@ def test_opensandbox_config_separates_requests_from_limits(monkeypatch) -> None:
         "-f",
         "/dev/null",
     ]
+    assert environment["kwargs"]["sandbox_provider"]["opensandbox"]["probe"] == {
+        "command": "python -c \"import bbh_mcp.server; print('nemo-gym-sandbox-ready')\"",
+        "expected_stdout": "nemo-gym-sandbox-ready",
+        "timeout_s": 180,
+        "deadline_s": 240,
+        "stable_count": 1,
+        "stable_delay_s": 0,
+    }

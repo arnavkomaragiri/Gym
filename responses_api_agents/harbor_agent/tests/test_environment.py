@@ -209,6 +209,57 @@ class TestStartStop:
         assert spec.entrypoint == ["sh", "/opt/entrypoint.sh", "tail", "-f", "/dev/null"]
 
     @pytest.mark.asyncio
+    async def test_start_applies_task_env_and_workdir(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("RUBRIC_MODEL_API_KEY", "test-key")  # pragma: allowlist secret
+        task_config = TaskEnvironmentConfig(
+            docker_image="docker.io/example/task:1.0",
+            workdir="/app",
+            env={
+                "RUBRIC_MODEL_API_KEY": "${RUBRIC_MODEL_API_KEY}",
+                "TASK_SETTING": "task-value",
+            },
+        )
+        env = _make_environment(
+            tmp_path,
+            task_env_config=task_config,
+            sandbox_env={"TASK_SETTING": "sandbox-value"},
+        )
+
+        await env.start(force_build=False)
+
+        spec = _provider().created_specs[0]
+        assert spec.workdir == "/app"
+        assert spec.env == {
+            "RUBRIC_MODEL_API_KEY": "test-key",  # pragma: allowlist secret
+            "TASK_SETTING": "sandbox-value",
+        }
+
+    @pytest.mark.asyncio
+    async def test_start_uploads_prebuilt_image_environment_dir(self, tmp_path):
+        environment_dir = tmp_path / "task" / "environment"
+        environment_dir.mkdir(parents=True)
+        (environment_dir / "task.jsonl").write_text('{"task": 1}\n')
+        env = _make_environment(
+            tmp_path,
+            task_env_config=TaskEnvironmentConfig(
+                docker_image="docker.io/example/task:1.0",
+                workdir="/app",
+            ),
+        )
+
+        await env.start(force_build=False)
+
+        provider = _provider()
+        assert len(provider.uploads) == 1
+        archive = next(iter(provider.uploads.values()))
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
+            task_file = tar.extractfile("./task.jsonl")
+            assert task_file is not None
+            assert task_file.read() == b'{"task": 1}\n'
+        upload_commands = [call["command"] for call in provider.exec_calls]
+        assert any("tar -xzf" in command and "-C /app" in command for command in upload_commands)
+
+    @pytest.mark.asyncio
     async def test_stop_always_kills_sandbox(self, tmp_path):
         env = _make_environment(tmp_path)
         await env.start(force_build=False)
@@ -255,6 +306,22 @@ class TestExec:
         assert call["cwd"] == "/app"
         assert call["env"] == {"A": "1"}
         assert call["timeout_s"] == 42
+
+    @pytest.mark.asyncio
+    async def test_exec_merges_task_and_per_command_env(self, tmp_path):
+        task_config = TaskEnvironmentConfig(
+            docker_image="docker.io/example/task:1.0",
+            env={"TASK_SETTING": "task-value", "OVERRIDDEN": "task-value"},
+        )
+        env = _make_environment(tmp_path, task_env_config=task_config)
+        await env.start(force_build=False)
+
+        await env.exec("env", env={"OVERRIDDEN": "command-value"})
+
+        assert _provider().exec_calls[-1]["env"] == {
+            "TASK_SETTING": "task-value",
+            "OVERRIDDEN": "command-value",
+        }
 
     @pytest.mark.asyncio
     async def test_exec_wraps_commands_in_interactive_bash_by_default(self, tmp_path):
