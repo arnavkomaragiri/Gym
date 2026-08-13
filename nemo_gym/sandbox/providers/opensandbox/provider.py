@@ -101,6 +101,7 @@ IMAGE_PULL_POLICY_EXTENSION_KEY = "imagePullPolicy"
 IMAGE_PULL_POLICY_ANNOTATION_EXTENSION_KEY = "opensandbox.extensions.image-pull-policy"
 VALID_IMAGE_PULL_POLICIES = {"Always", "IfNotPresent", "Never"}
 STATUS_CODE_RE = re.compile(r"(?:status code|http)\D+(\d{3})", re.IGNORECASE)
+SERVER_PROXY_API_KEY_HEADER = "OPEN-SANDBOX-API-KEY"
 
 
 def validate_image_pull_policy(image_pull_policy: str) -> str:
@@ -630,6 +631,9 @@ class OpenSandboxProvider:
             kwargs["request_timeout"] = timedelta(seconds=request_timeout_s)
         if self._connection.use_server_proxy:
             kwargs["use_server_proxy"] = True
+            if self._connection.api_key is not None:
+                # SDK 0.1.x does not forward api_key to proxied execd requests.
+                kwargs["headers"] = {SERVER_PROXY_API_KEY_HEADER: self._connection.api_key}
         if (
             self._connection.keepalive_expiry_s is not None
             or self._connection.disable_connection_pooling
