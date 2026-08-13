@@ -44,6 +44,7 @@ from nemo_gym.openai_utils import (
     NeMoGymFunctionCallOutput,
     NeMoGymFunctionDefinition,
     NeMoGymFunctionToolParam,
+    NeMoGymReasoning,
     NeMoGymResponse,
     NeMoGymResponseCreateParamsNonStreaming,
     NeMoGymResponseFunctionToolCall,
@@ -55,7 +56,6 @@ from nemo_gym.openai_utils import (
     NeMoGymResponseReasoningItem,
     NeMoGymResponseUsage,
     NeMoGymSummary,
-    Reasoning,
     TokenIDLogProbMixin,
 )
 
@@ -379,7 +379,11 @@ class ResponsesConverter(BaseModel):
             metadata=chat_completion_create_params.metadata,
             model=chat_completion_create_params.model,
             parallel_tool_calls=chat_completion_create_params.parallel_tool_calls,
-            reasoning=Reasoning(reasoning_effort=chat_completion_create_params.reasoning_effort),
+            reasoning=(
+                NeMoGymReasoning(effort=chat_completion_create_params.reasoning_effort)
+                if chat_completion_create_params.reasoning_effort is not None
+                else None
+            ),
             service_tier=chat_completion_create_params.service_tier,
             store=chat_completion_create_params.store,
             temperature=chat_completion_create_params.temperature,

@@ -247,9 +247,13 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
         await sandbox.start()
         self._sandbox = sandbox
 
-        # Bind mounts in Harbor's Docker backend, so they must be created here
-        # for the agent and verifier to have somewhere to write.
-        log_dirs = f"{EnvironmentPaths.agent_dir} {EnvironmentPaths.verifier_dir}"
+        # Harbor's local backends bind mount these convention directories. The
+        # remote provider must create all of them before agents start writing.
+        log_dirs = (
+            f"{EnvironmentPaths.agent_dir} "
+            f"{EnvironmentPaths.verifier_dir} "
+            f"{EnvironmentPaths.artifacts_dir}"
+        )
         result = await self._sandbox.exec(f"mkdir -p {log_dirs}", timeout_s=60)
         if result.return_code != 0:
             raise RuntimeError(

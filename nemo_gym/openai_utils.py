@@ -60,7 +60,6 @@ from openai.types.responses import (
 )
 from openai.types.responses.response_create_params import (
     Metadata,
-    Reasoning,
     ResponseIncludable,
     ResponsePromptParam,
     ResponsesModel,
@@ -305,6 +304,18 @@ NeMoGymResponseInputItem = Union[
 NeMoGymResponseInput: TypeAlias = List[NeMoGymResponseInputItem]
 
 
+class NeMoGymReasoning(BaseModel):
+    """Current Responses reasoning controls missing from older OpenAI SDK pins."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    context: Optional[Literal["auto", "current_turn", "all_turns"]] = None
+    effort: Optional[Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]] = None
+    generate_summary: Optional[Literal["auto", "concise", "detailed"]] = None
+    mode: Optional[str] = None
+    summary: Optional[Literal["auto", "concise", "detailed"]] = None
+
+
 class NeMoGymResponseCreateParamsNonStreaming(BaseModel):
     """
     This class is a copy of openai.types.responses.response_create_params.ResponseCreateParamsNonStreaming
@@ -325,7 +336,7 @@ class NeMoGymResponseCreateParamsNonStreaming(BaseModel):
     parallel_tool_calls: bool = True  # OpenAI default
     previous_response_id: Optional[str] = None
     prompt: Optional[ResponsePromptParam] = None
-    reasoning: Optional[Reasoning] = None
+    reasoning: Optional[NeMoGymReasoning] = None
     service_tier: Optional[Literal["auto", "default", "flex", "scale", "priority"]] = None
     store: Optional[bool] = None
     temperature: Optional[float] = None
@@ -383,6 +394,8 @@ def accumulate_response_usage(
 
 class NeMoGymResponse(Response):
     output: List[NeMoGymResponseOutputItem]
+    # Override the pinned SDK response type together with the request type.
+    reasoning: Optional[NeMoGymReasoning] = None
     usage: Optional[NeMoGymResponseUsage] = None
 
 

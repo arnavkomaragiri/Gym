@@ -8,7 +8,8 @@ gym_harbor_agent:
       domain: agent
       token_id_capture: true
 
-      jobs_dir: ${oc.env:RAY_TMPDIR,/tmp}/gym_harbor_agent_jobs
+      # Set HARBOR_JOBS_DIR to shared storage when Ray workers span nodes.
+      jobs_dir: ${oc.env:HARBOR_JOBS_DIR,${oc.env:RAY_TMPDIR,/tmp}/gym_harbor_agent_jobs}
 
       # Follows harbor.models.job.config.DatasetConfig.
       dataset:

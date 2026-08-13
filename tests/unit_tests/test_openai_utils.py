@@ -68,6 +68,26 @@ class TestNeMoGymResponseCreateParamsNonStreaming:
         with pytest.raises(ValidationError):
             NeMoGymResponseCreateParamsNonStreaming(input="hello", not_a_real_field=1)
 
+    def test_current_reasoning_efforts_validate_and_round_trip(self) -> None:
+        params = NeMoGymResponseCreateParamsNonStreaming(
+            input="hello",
+            reasoning={"effort": "none", "summary": "auto"},
+        )
+
+        assert params.model_dump()["reasoning"] == {
+            "context": None,
+            "effort": "none",
+            "generate_summary": None,
+            "mode": None,
+            "summary": "auto",
+        }
+
+        response = NeMoGymResponse.model_validate(
+            _response_with_output([]) | {"reasoning": params.reasoning.model_dump()}
+        )
+        assert response.reasoning is not None
+        assert response.reasoning.effort == "none"
+
 
 class TestNeMoGymResponseHostedMcpItems:
     """Hosted-MCP output items (``mcp_call`` etc.) must validate rather than 500.
