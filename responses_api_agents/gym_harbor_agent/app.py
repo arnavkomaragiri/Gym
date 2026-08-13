@@ -75,6 +75,7 @@ class HarborAgentConfig(BaseResponsesAPIAgentConfig):
     model_base_url_env_var: str = "OPENAI_BASE_URL"
     model_api_key_env_var: str = "OPENAI_API_KEY"
     model_api_key: str
+    environment_build_timeout_multiplier: float | None = None
 
     @field_validator("jobs_dir", mode="after")
     @classmethod
@@ -113,6 +114,7 @@ class HarborAgentConfig(BaseResponsesAPIAgentConfig):
             n_concurrent_trials=1,
             quiet=True,
             retry=RetryConfig(max_retries=0),
+            environment_build_timeout_multiplier=self.environment_build_timeout_multiplier,
             environment=self.environment.model_copy(update={"delete": True}),
             agents=[agent],
             datasets=[
@@ -149,15 +151,21 @@ class HarborAgent(SimpleResponsesAPIAgent):
     async def run(self, body: HarborRunRequest) -> HarborVerifyResponse:
         async with self._sem:
             try:
+                rollout_id = self.rollout_id_from_run(body)
                 model_base_url = self.resolve_model_base_url(
                     self.config.model_server.name,
-                    self.rollout_id_from_run(body),
+                    rollout_id,
                 )
                 agent = self.config.agent_for_model_server(model_base_url)
+                job_name = f"t{body.task_index}-r{body.rollout_index}"
+                if rollout_id is not None:
+                    # The routed model URL is part of Harbor's job config. NRL
+                    # assigns a new rollout id when it redispatches a failed
+                    # sample, so each dispatch needs its own job directory.
+                    job_name = f"{job_name}-{rollout_id}"
                 job_config = self.config.build_job_config(
                     task_name=body.task_name,
-                    # Use a stable job name to allow resume.
-                    job_name=f"t{body.task_index}-r{body.rollout_index}",
+                    job_name=job_name,
                     agent=agent,
                 )
 

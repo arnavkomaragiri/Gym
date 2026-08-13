@@ -25,6 +25,10 @@ gym_harbor_agent:
       dataset:
         path: ${oc.env:HARBOR_DATASET_PATH}
 
+      # Must exceed OpenSandbox's create/readiness bounds. Harbor otherwise
+      # cancels environment.start() at the task's default 600 seconds.
+      environment_build_timeout_multiplier: 3.0
+
       environment:
         type: null
         import_path: responses_api_agents.harbor_agent.custom_envs.nemo_gym_sandbox.environment:NemoGymSandboxEnvironment

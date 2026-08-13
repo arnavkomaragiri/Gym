@@ -1,6 +1,7 @@
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
 from harbor.models.trial.config import AgentConfig
 from omegaconf import OmegaConf
 
@@ -57,6 +58,7 @@ def test_agent_for_model_server_injects_route_without_mutating_config(tmp_path: 
 
 def test_build_job_config_scopes_task_and_forces_environment_cleanup(tmp_path: Path) -> None:
     config = make_config(tmp_path)
+    config.environment_build_timeout_multiplier = 3.0
     agent = AgentConfig(name="opencode", model_name="openai/test-model")
 
     job = config.build_job_config("bbh-task", "t0-r1", agent)
@@ -66,6 +68,7 @@ def test_build_job_config_scopes_task_and_forces_environment_cleanup(tmp_path: P
     assert job.datasets[0].task_names == ["bbh-task"]
     assert job.agents == [agent]
     assert job.environment.delete is True
+    assert job.environment_build_timeout_multiplier == 3.0
     assert job.n_attempts == 1
     assert job.n_concurrent_trials == 1
 
@@ -98,6 +101,39 @@ def test_nrl_rollout_id_routes_to_prefixed_gym_model_url(tmp_path: Path) -> None
 
     assert rollout_id == "nrl-step7-sample3"
     assert base_url == "http://model-host:9000/ng-rollout/nrl-step7-sample3/v1"
+
+
+@patch("responses_api_agents.gym_harbor_agent.app.harbor_job_worker")
+@pytest.mark.asyncio
+async def test_run_scopes_harbor_job_dir_to_rollout_id(harbor_job_worker, tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    server_client = MagicMock()
+    server_client.global_config_dict = {
+        "token_id_capture": {"enabled": True},
+        "policy_model": {"responses_api_models": {"vllm_model": {"host": "model-host", "port": 9000}}},
+    }
+    server_client._build_server_base_url.return_value = "http://model-host:9000"
+    with patch(
+        "responses_api_agents.gym_harbor_agent.app.get_global_config_dict",
+        return_value={},
+    ):
+        agent = HarborAgent.model_construct(config=config, server_client=server_client)
+    body = HarborRunRequest(
+        task_name="bbh-task",
+        responses_create_params=NeMoGymResponseCreateParamsNonStreaming(input=[]),
+        **{
+            "_ng_task_index": 3,
+            "_ng_rollout_index": 1,
+            "_ng_rollout_id": "nrl-step7-sample3",
+        },
+    )
+    harbor_job_worker.remote.side_effect = RuntimeError("stop after config capture")
+
+    response = await agent.run(body)
+
+    job_config = harbor_job_worker.remote.call_args.args[0]
+    assert job_config["job_name"] == "t3-r1-nrl-step7-sample3"
+    assert response.reward == 0.0
 
 
 def test_opensandbox_config_separates_requests_from_limits(monkeypatch) -> None:
@@ -135,6 +171,7 @@ def test_opensandbox_config_separates_requests_from_limits(monkeypatch) -> None:
     assert environment["import_path"].endswith(":NemoGymSandboxEnvironment")
     assert environment["override_cpus"] == 4
     assert environment["override_memory_mb"] == 65536
+    assert agent_config.environment_build_timeout_multiplier == 3.0
     assert environment["kwargs"]["sandbox_provider_options"] == {"resource_requests": {"cpu": 0.25, "memory_mib": 512}}
     assert environment["kwargs"]["sandbox_provider"]["opensandbox"]["connection"]["api_key"] == "test-key"
     assert environment["kwargs"]["sandbox_provider"]["opensandbox"]["connection"]["protocol"] == "https"

@@ -299,13 +299,24 @@ class TestExec:
         provider = _provider()
         provider.queue_exec_result(SandboxExecResult(stdout="out", stderr="err", return_code=7))
 
-        result = await env.exec("echo hi", cwd="/app", env={"A": "1"}, timeout_sec=42)
+        result = await env.exec("echo hi", cwd="/app", env={"A": "1"}, timeout_sec=42, user=1000)
         assert (result.stdout, result.stderr, result.return_code) == ("out", "err", 7)
         call = provider.exec_calls[-1]
         assert call["command"] == "echo hi"
         assert call["cwd"] == "/app"
         assert call["env"] == {"A": "1"}
         assert call["timeout_s"] == 42
+        assert call["user"] == 1000
+
+    @pytest.mark.asyncio
+    async def test_exec_uses_harbor_default_user(self, tmp_path):
+        env = _make_environment(tmp_path)
+        env.default_user = "agent"
+        await env.start(force_build=False)
+
+        await env.exec("id")
+
+        assert _provider().exec_calls[-1]["user"] == "agent"
 
     @pytest.mark.asyncio
     async def test_exec_merges_task_and_per_command_env(self, tmp_path):
