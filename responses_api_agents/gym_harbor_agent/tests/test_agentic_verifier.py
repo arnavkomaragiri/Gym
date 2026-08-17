@@ -1,0 +1,223 @@
+from __future__ import annotations
+
+import contextlib
+import json
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+from uuid import uuid4
+
+import pytest
+from harbor.environments.base import ExecResult
+from harbor.models.agent.context import AgentContext
+from harbor.models.task.config import TaskOS
+from harbor.models.trial.paths import TrialPaths
+
+from responses_api_agents.gym_harbor_agent.agentic_verifier import (
+    AgenticVerifier,
+    AgenticVerifierConfig,
+)
+
+
+class FakeJudge:
+    def __init__(self, reward_path: Path, config) -> None:
+        self.reward_path = reward_path
+        self.config = config
+        self.extra_env = dict(config.env)
+        self.session_id = None
+        self.context_id = None
+        self.instructions: list[str] = []
+
+    async def setup(self, environment) -> None:
+        await environment.exec("judge-setup")
+
+    async def run(self, instruction: str, environment, context: AgentContext) -> None:
+        self.instructions.append(instruction)
+        await environment.exec("judge-run")
+        self.reward_path.write_text(json.dumps({"reward": 0.75}))
+
+    def populate_context_post_run(self, context: AgentContext) -> None:
+        context.metadata = {"judge": "complete"}
+
+
+def make_task(tmp_path: Path):
+    tests_dir = tmp_path / "task" / "tests"
+    tests_dir.mkdir(parents=True)
+    (tests_dir / "judge_instruction.md").write_text("Inspect and score /app.\n")
+    paths = SimpleNamespace(
+        tests_dir=tests_dir,
+        step_tests_dir=lambda _name: tmp_path / "missing-step-tests",
+    )
+    verifier = SimpleNamespace(
+        env={
+            "RUBRIC_MODEL_API_KEY": "${TEST_JUDGE_KEY}",
+            "RUBRIC_MODEL_API_BASE": "${TEST_JUDGE_BASE}",
+        }
+    )
+    return SimpleNamespace(paths=paths, config=SimpleNamespace(verifier=verifier))
+
+
+def make_environment(*, separate: bool = True):
+    @contextlib.contextmanager
+    def scoped_exec_env(_env):
+        yield
+
+    environment = SimpleNamespace(
+        session_id=("task__trial__verifier__rollout" if separate else "task__trial__env"),
+        context_id=uuid4(),
+        os=TaskOS.LINUX,
+        capabilities=SimpleNamespace(mounted=True),
+        upload_dir=AsyncMock(),
+        download_dir=AsyncMock(),
+        ensure_dirs=AsyncMock(),
+        exec=AsyncMock(return_value=ExecResult(stdout="", stderr="", return_code=0)),
+        scoped_exec_env=scoped_exec_env,
+    )
+    return environment
+
+
+def make_config() -> dict:
+    return {
+        "judge_agent": {
+            "name": "nop",
+            "model_name": "judge-model",
+            "mcp_servers": [
+                {
+                    "name": "harbor_score",
+                    "transport": "stdio",
+                    "command": "python3",
+                    "args": ["/tests/score_solution.py"],
+                }
+            ],
+        },
+        "judge_env_aliases": {
+            "OPENAI_API_KEY": "RUBRIC_MODEL_API_KEY",
+            "OPENAI_BASE_URL": "RUBRIC_MODEL_API_BASE",
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("api_mode", "package"),
+    [
+        ("chat_completions", "@ai-sdk/openai-compatible"),
+        ("responses", "@ai-sdk/openai"),
+    ],
+)
+def test_configures_opencode_judge_api_transport(
+    monkeypatch,
+    tmp_path: Path,
+    api_mode: str,
+    package: str,
+) -> None:
+    monkeypatch.setenv("TEST_JUDGE_KEY", "secret-key")
+    monkeypatch.setenv("TEST_JUDGE_BASE", "https://judge.test/v1")
+    config = make_config()
+    config["judge_agent"] = {
+        "name": "opencode",
+        "model_name": "org/judge-model",
+    }
+    config["judge_opencode_provider"] = {
+        "api_mode": api_mode,
+        "base_url": "https://judge.test/v1",
+    }
+    trial_paths = TrialPaths(tmp_path / "trial")
+    trial_paths.mkdir()
+    verifier = AgenticVerifier(
+        task=make_task(tmp_path),
+        trial_paths=trial_paths,
+        environment=make_environment(),
+        config=config,
+    )
+
+    judge = verifier._resolved_judge_agent()
+
+    assert judge.model_name == "rubric/org/judge-model"
+    opencode_config = judge.kwargs["opencode_config"]
+    assert opencode_config["small_model"] == "rubric/org/judge-model"
+    assert opencode_config["provider"] == {
+        "rubric": {
+            "npm": package,
+            "name": "Rubric model",
+            "options": {
+                "baseURL": "https://judge.test/v1",
+                "apiKey": "{env:OPENAI_API_KEY}",
+            },
+            "models": {
+                "org/judge-model": {
+                    "name": "org/judge-model",
+                    "reasoning": True,
+                    "tool_call": True,
+                }
+            },
+        }
+    }
+
+
+@pytest.mark.asyncio
+async def test_runs_judge_through_harbor_agent_factory(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("TEST_JUDGE_KEY", "secret-key")
+    monkeypatch.setenv("TEST_JUDGE_BASE", "https://judge.test/v1")
+    trial_paths = TrialPaths(tmp_path / "trial")
+    trial_paths.mkdir()
+    environment = make_environment()
+    created = {}
+
+    def create_agent(config, **_kwargs):
+        created["config"] = config
+        created["kwargs"] = _kwargs
+        created["judge"] = FakeJudge(trial_paths.reward_json_path, config)
+        return created["judge"]
+
+    monkeypatch.setattr(
+        "responses_api_agents.gym_harbor_agent.agentic_verifier.AgentFactory.create_agent_from_config",
+        create_agent,
+    )
+    verifier = AgenticVerifier(
+        task=make_task(tmp_path),
+        trial_paths=trial_paths,
+        environment=environment,
+        config=make_config(),
+    )
+
+    result = await verifier.verify()
+
+    assert result.rewards == {"reward": 0.75}
+    assert created["config"].env == {
+        "OPENAI_API_KEY": "secret-key",
+        "OPENAI_BASE_URL": "https://judge.test/v1",
+    }
+    assert created["config"].mcp_servers[0].name == "harbor_score"
+    assert created["kwargs"]["mcp_servers"] == created["config"].mcp_servers
+    assert created["judge"].instructions == ["Inspect and score /app.\n"]
+    environment.upload_dir.assert_not_awaited()
+    assert [call.kwargs["cwd"] for call in environment.exec.await_args_list] == [
+        "/judge",
+        "/judge",
+    ]
+    assert json.loads((trial_paths.verifier_dir / "judge" / "context.json").read_text())["metadata"] == {
+        "judge": "complete"
+    }
+
+
+@pytest.mark.asyncio
+async def test_rejects_shared_verifier_environment(tmp_path: Path) -> None:
+    trial_paths = TrialPaths(tmp_path / "trial")
+    trial_paths.mkdir()
+    verifier = AgenticVerifier(
+        task=make_task(tmp_path),
+        trial_paths=trial_paths,
+        environment=make_environment(separate=False),
+        config=make_config(),
+    )
+
+    with pytest.raises(ValueError, match="environment_mode='separate'"):
+        await verifier.verify()
+
+
+def test_config_rejects_reward_path_outside_verifier_logs() -> None:
+    config = make_config()
+    config["reward_path"] = "/app/reward.json"
+
+    with pytest.raises(ValueError, match="under /logs/verifier"):
+        AgenticVerifierConfig.model_validate(config)

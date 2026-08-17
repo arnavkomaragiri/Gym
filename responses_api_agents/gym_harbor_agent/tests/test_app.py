@@ -2,7 +2,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-from harbor.models.trial.config import AgentConfig
+from harbor.models.trial.config import AgentConfig, ArtifactConfig, VerifierConfig
 from omegaconf import OmegaConf
 
 from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
@@ -24,7 +24,7 @@ def make_config(tmp_path: Path) -> HarborAgentConfig:
         dataset={"path": tmp_path / "dataset"},
         agent={
             "name": "opencode",
-            "model_name": "openai/test-model",
+            "model_name": "nemo/test-model",
             "env": {"EXISTING": "value"},
         },
         environment={"type": "docker"},
@@ -44,17 +44,26 @@ def test_jobs_dir_defaults_to_ray_tmpdir(monkeypatch) -> None:
     monkeypatch.delenv("HARBOR_JOBS_DIR", raising=False)
     monkeypatch.setenv("RAY_TMPDIR", "/tmp/ray-test")
 
-    config = OmegaConf.load(gym_root / "responses_api_agents/gym_harbor_agent/configs/harbor_agent.yaml")
+    config = OmegaConf.merge(
+        {"policy_model_name": "test-model"},
+        OmegaConf.load(gym_root / "responses_api_agents/gym_harbor_agent/configs/harbor_agent.yaml"),
+    )
 
     assert config.gym_harbor_agent.responses_api_agents.gym_harbor_agent.jobs_dir == (
         "/tmp/ray-test/gym_harbor_agent_jobs"
     )
+    assert config.gym_harbor_agent.responses_api_agents.gym_harbor_agent.agent.model_name.startswith("nemo/")
+    assert config.gym_harbor_agent.responses_api_agents.gym_harbor_agent.context_window == 131072
+    assert config.policy_model.responses_api_models.vllm_model.reasoning_response_field == "reasoning_content"
 
 
 def test_agent_for_model_server_injects_route_without_mutating_config(tmp_path: Path) -> None:
     config = make_config(tmp_path)
 
-    agent = config.agent_for_model_server("http://model/ng-rollout/t0-r1/v1")
+    agent = config.agent_for_model_server(
+        "http://model/ng-rollout/t0-r1/v1",
+        auxiliary_base_url="http://model/v1",
+    )
 
     assert agent.env == {
         "EXISTING": "value",
@@ -62,7 +71,35 @@ def test_agent_for_model_server_injects_route_without_mutating_config(tmp_path: 
         "OPENAI_API_KEY": "test-key",  # pragma: allowlist secret
     }
     assert agent.kwargs == {
-        "opencode_config": {"provider": {"openai": {"options": {"baseURL": "http://model/ng-rollout/t0-r1/v1"}}}}
+        "opencode_config": {
+            "provider": {
+                "nemo": {
+                    "npm": "@ai-sdk/openai-compatible",
+                    "options": {
+                        "baseURL": "http://model/ng-rollout/t0-r1/v1",
+                        "apiKey": "EMPTY",  # pragma: allowlist secret
+                    },
+                    "models": {
+                        "test-model": {
+                            "name": "test-model",
+                            "reasoning": True,
+                            "tool_call": True,
+                            "interleaved": {"field": "reasoning"},
+                            "limit": {"context": 262144, "output": 131072},
+                        }
+                    },
+                },
+                "nemo-auxiliary": {
+                    "npm": "@ai-sdk/openai-compatible",
+                    "options": {
+                        "baseURL": "http://model/v1",
+                        "apiKey": "EMPTY",  # pragma: allowlist secret
+                    },
+                    "models": {"test-model": {"name": "test-model"}},
+                },
+            },
+            "small_model": "nemo-auxiliary/test-model",
+        }
     }
     assert config.agent.env == {"EXISTING": "value"}
     assert config.agent.kwargs == {}
@@ -71,7 +108,12 @@ def test_agent_for_model_server_injects_route_without_mutating_config(tmp_path: 
 def test_build_job_config_scopes_task_and_forces_environment_cleanup(tmp_path: Path) -> None:
     config = make_config(tmp_path)
     config.environment_build_timeout_multiplier = 3.0
-    agent = AgentConfig(name="opencode", model_name="openai/test-model")
+    config.verifier = VerifierConfig(
+        import_path=("responses_api_agents.gym_harbor_agent.agentic_verifier:AgenticVerifier"),
+        kwargs={"config": {"judge_agent": {"name": "nop"}}},
+    )
+    config.artifacts = [ArtifactConfig(source="/app", exclude=["data"])]
+    agent = AgentConfig(name="opencode", model_name="nemo/test-model")
 
     job = config.build_job_config("bbh-task", "t0-r1", agent)
 
@@ -80,6 +122,8 @@ def test_build_job_config_scopes_task_and_forces_environment_cleanup(tmp_path: P
     assert job.datasets[0].task_names == ["bbh-task"]
     assert job.agents == [agent]
     assert job.environment.delete is True
+    assert job.verifier == config.verifier
+    assert job.artifacts == config.artifacts
     assert job.environment_build_timeout_multiplier == 3.0
     assert job.n_attempts == 1
     assert job.n_concurrent_trials == 1
@@ -145,7 +189,26 @@ async def test_run_scopes_harbor_job_dir_to_rollout_id(harbor_job_worker, tmp_pa
 
     job_config = harbor_job_worker.remote.call_args.args[0]
     assert job_config["job_name"] == "t3-r1-nrl-step7-sample3"
+    assert job_config["agents"][0]["kwargs"]["opencode_config"]["small_model"] == ("nemo-auxiliary/test-model")
+    assert (
+        job_config["agents"][0]["kwargs"]["opencode_config"]["provider"]["nemo-auxiliary"]["options"]["baseURL"]
+        == "http://model-host:9000/v1"
+    )
     assert response.reward == 0.0
+
+
+def test_explicit_opencode_small_model_is_preserved(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    config.agent.kwargs = {"opencode_config": {"small_model": "custom/title-model"}}
+
+    agent = config.agent_for_model_server(
+        "http://model/ng-rollout/t0-r1/v1",
+        auxiliary_base_url="http://model/v1",
+    )
+
+    opencode_config = agent.kwargs["opencode_config"]
+    assert opencode_config["small_model"] == "custom/title-model"
+    assert "nemo-auxiliary" not in opencode_config["provider"]
 
 
 def test_opensandbox_config_separates_requests_from_limits(monkeypatch) -> None:
@@ -187,7 +250,10 @@ def test_opensandbox_config_separates_requests_from_limits(monkeypatch) -> None:
     assert environment["override_cpus"] == 4
     assert environment["override_memory_mb"] == 65536
     assert agent_config.environment_build_timeout_multiplier == 3.0
-    assert environment["kwargs"]["sandbox_provider_options"] == {"resource_requests": {"cpu": 0.25, "memory_mib": 512}}
+    assert environment["kwargs"]["sandbox_provider_options"] == {
+        "resource_requests": {"cpu": 0.25, "memory_mib": 512},
+        "volumes": [],
+    }
     assert environment["kwargs"]["sandbox_provider"]["opensandbox"]["connection"]["api_key"] == "test-key"
     assert environment["kwargs"]["sandbox_provider"]["opensandbox"]["connection"]["protocol"] == "https"
     assert environment["kwargs"]["sandbox_provider"]["opensandbox"]["connection"]["use_server_proxy"] is False
@@ -211,3 +277,39 @@ def test_opensandbox_config_separates_requests_from_limits(monkeypatch) -> None:
         "stable_count": 1,
         "stable_delay_s": 0,
     }
+
+
+def test_agentic_verifier_config_keeps_policy_and_judge_agents_independent(
+    monkeypatch,
+) -> None:
+    gym_root = Path(__file__).resolve().parents[3]
+    monkeypatch.setenv("RUBRIC_MODEL", "judge-model")
+    monkeypatch.setenv("RUBRIC_MODEL_API_BASE", "https://judge.test/v1")
+    monkeypatch.setenv("RUBRIC_MODEL_API_MODE", "responses")
+    monkeypatch.setenv("HARBOR_POLICY_WORKSPACE_EXCLUDES", "[data]")
+
+    config = OmegaConf.merge(
+        {"policy_model_name": "policy-model", "policy_api_key": "policy-key"},
+        OmegaConf.load(gym_root / "responses_api_agents/gym_harbor_agent/configs/harbor_agent.yaml"),
+        OmegaConf.load(gym_root / "responses_api_agents/gym_harbor_agent/configs/harbor_agent_agentic_verifier.yaml"),
+    )
+    agent_config = OmegaConf.to_container(
+        config.gym_harbor_agent.responses_api_agents.gym_harbor_agent,
+        resolve=True,
+    )
+
+    assert agent_config["agent"]["model_name"] == "nemo/policy-model"
+    verifier = agent_config["verifier"]
+    assert verifier["import_path"].endswith(":AgenticVerifier")
+    judge = verifier["kwargs"]["config"]["judge_agent"]
+    assert judge["name"] == "opencode"
+    assert judge["model_name"] == "judge-model"
+    assert verifier["kwargs"]["config"]["judge_opencode_provider"] == {
+        "api_mode": "responses",
+        "base_url": "https://judge.test/v1",
+    }
+    assert verifier["kwargs"]["config"]["judge_env_aliases"] == {
+        "OPENAI_API_KEY": "RUBRIC_MODEL_API_KEY",
+        "OPENAI_BASE_URL": "RUBRIC_MODEL_API_BASE",
+    }
+    assert agent_config["artifacts"] == [{"source": "/app", "exclude": ["data"]}]

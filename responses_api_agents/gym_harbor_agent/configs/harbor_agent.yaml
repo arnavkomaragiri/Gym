@@ -15,11 +15,14 @@ gym_harbor_agent:
       dataset:
         path: ${oc.env:HOME}/store/data/edison/harbor-bbh/val
 
-      # OpenCode's OpenAI provider is routed through the Gym policy model.
+      # OpenCode's OpenAI-compatible provider is routed through the Gym policy model.
       agent:
         name: opencode
-        model_name: openai/${policy_model_name}
+        model_name: nemo/${policy_model_name}
         env: {}
+      context_window: 131072
+      max_output_tokens: 131072
+      reasoning_field: reasoning
       model_server:
         type: responses_api_models
         name: policy_model
@@ -30,3 +33,10 @@ gym_harbor_agent:
       # Follows harbor.models.trial.config.EnvironmentConfig.
       environment:
         type: docker
+
+# Preserve vLLM parser output as an OpenAI-compatible reasoning field so
+# OpenCode can replay it on subsequent turns.
+policy_model:
+  responses_api_models:
+    vllm_model:
+      reasoning_response_field: reasoning_content

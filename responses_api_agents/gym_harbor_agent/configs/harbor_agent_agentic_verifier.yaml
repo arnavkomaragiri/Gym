@@ -1,0 +1,44 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Layer this after harbor_agent.yaml. The task must use Harbor's separate
+# verifier mode and provide judge_instruction.md plus score_solution.py under
+# its hidden tests directory.
+gym_harbor_agent:
+  responses_api_agents:
+    gym_harbor_agent:
+      verifier:
+        import_path: responses_api_agents.gym_harbor_agent.agentic_verifier:AgenticVerifier
+        override_timeout_sec: 2400
+        kwargs:
+          config:
+            judge_agent:
+              name: opencode
+              model_name: ${oc.env:RUBRIC_MODEL}
+              env: {}
+              mcp_servers:
+                - name: harbor_score
+                  transport: stdio
+                  command: python3
+                  args:
+                    - /tests/score_solution.py
+            judge_opencode_provider:
+              api_mode: ${oc.env:RUBRIC_MODEL_API_MODE,chat_completions}
+              base_url: ${oc.env:RUBRIC_MODEL_API_BASE}
+            judge_env_aliases:
+              OPENAI_API_KEY: RUBRIC_MODEL_API_KEY
+              OPENAI_BASE_URL: RUBRIC_MODEL_API_BASE
+            instruction_path: judge_instruction.md
+            judge_workdir: /judge
+            reward_path: /logs/verifier/reward.json
+            judge_logs_subdir: judge
+            setup_timeout_sec: 900
+            run_timeout_sec: 1400
+
+      # Harbor collects this after the policy exits and rehydrates it at the
+      # same path in the separate verifier sandbox. Set
+      # HARBOR_POLICY_WORKSPACE_EXCLUDES='[data]' only when /app/data is
+      # independently mounted into both sandboxes.
+      artifacts:
+        - source: /app
+          exclude: ${oc.create:${oc.env:HARBOR_POLICY_WORKSPACE_EXCLUDES,[]}}

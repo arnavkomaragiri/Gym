@@ -32,10 +32,12 @@ import shlex
 import tarfile
 import tempfile
 import uuid
+from collections.abc import Sequence
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Optional
 
 from harbor.environments.base import BaseEnvironment, ExecResult
+from harbor.environments.definition import should_upload_environment_dir
 from harbor.models.environment_type import EnvironmentType
 from harbor.models.task.config import NetworkMode
 from harbor.models.trial.paths import EnvironmentPaths
@@ -83,7 +85,13 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
         sandbox_metadata: Extra ``SandboxSpec.metadata`` entries.
         sandbox_provider_options: ``SandboxSpec.provider_options`` passed through
             to the provider, e.g. ``resource_requests`` to schedule sandboxes
-            below their resource limits.
+            below their resource limits. String values may contain
+            ``{environment_name}``, ``{task_id}``, or ``{session_id}``; these
+            are expanded per trial. This is useful for a volume ``sub_path``.
+        environment_upload_excludes: Relative paths omitted when Harbor uploads
+            the task's ``environment/`` directory. Use this only when the image
+            or a sandbox volume supplies those paths, e.g. ``["data"]`` with a
+            task-specific volume mounted at ``/app/data``.
         sandbox_env: Extra environment variables set in the sandbox.
         sandbox_ttl_s: Sandbox server-side TTL safety net (default 21600).
         sandbox_ready_timeout_s: Create/readiness timeout incl. image pull
@@ -125,6 +133,7 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
         sandbox_provider: Optional[Mapping[str, Any]] = None,
         sandbox_metadata: Optional[Mapping[str, Any]] = None,
         sandbox_provider_options: Optional[Mapping[str, Any]] = None,
+        environment_upload_excludes: Optional[Sequence[str]] = None,
         sandbox_env: Optional[Mapping[str, str]] = None,
         sandbox_ttl_s: Optional[float] = 21600,
         sandbox_ready_timeout_s: Optional[float] = 900,
@@ -143,6 +152,7 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
         self._sandbox_provider = sandbox_provider
         self._sandbox_metadata = dict(sandbox_metadata or {})
         self._sandbox_provider_options = dict(sandbox_provider_options or {})
+        self._environment_upload_excludes = self._validate_upload_excludes(environment_upload_excludes or ())
         self._sandbox_env = {str(k): str(v) for k, v in dict(sandbox_env or {}).items()}
         self._sandbox_ttl_s = sandbox_ttl_s
         self._sandbox_ready_timeout_s = sandbox_ready_timeout_s
@@ -196,6 +206,52 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
             return self._image_override
         return rewrite_image(self.task_env_config.docker_image, self._image_rewrites)
 
+    @staticmethod
+    def _validate_upload_excludes(excludes: Sequence[str]) -> tuple[PurePosixPath, ...]:
+        normalized: list[PurePosixPath] = []
+        for value in excludes:
+            path = PurePosixPath(str(value))
+            if path.is_absolute() or not path.parts or any(part in {"", ".", ".."} for part in path.parts):
+                raise ValueError(
+                    "environment_upload_excludes entries must be non-empty relative paths "
+                    f"without '.' or '..' components (got {value!r})."
+                )
+            normalized.append(path)
+        return tuple(normalized)
+
+    def _render_provider_option_templates(self, value: Any) -> Any:
+        if isinstance(value, str):
+            task_id = self.environment_name.rsplit("__", 1)[-1]
+            replacements = {
+                "{environment_name}": self.environment_name,
+                "{task_id}": task_id,
+                "{session_id}": self.session_id,
+            }
+            for placeholder, replacement in replacements.items():
+                value = value.replace(placeholder, replacement)
+            return value
+        if isinstance(value, Mapping):
+            return {key: self._render_provider_option_templates(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self._render_provider_option_templates(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self._render_provider_option_templates(item) for item in value)
+        return value
+
+    def _is_environment_upload(self, source: Path) -> bool:
+        return source.resolve() == Path(self.environment_dir).resolve()
+
+    @property
+    def _is_separate_verifier(self) -> bool:
+        # Harbor assigns separate verifier environments a stable
+        # ``<trial>__verifier__<step>`` session id.
+        return "__verifier__" in self.session_id
+
+    def _is_upload_excluded(self, relative: PurePosixPath) -> bool:
+        return any(
+            relative == excluded or excluded in relative.parents for excluded in self._environment_upload_excludes
+        )
+
     def _build_spec(self) -> SandboxSpec:
         config = self.task_env_config
         resources: dict[str, Any] = {}
@@ -211,6 +267,7 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
         metadata = {
             "harbor-session": self.session_id,
             "harbor-task": self.environment_name,
+            "harbor-role": "verifier" if self._is_separate_verifier else "agent",
             **resolve_provider_metadata(self._sandbox_provider),
             **self._sandbox_metadata,
         }
@@ -224,8 +281,25 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
             metadata=metadata,
             resources=resources,
             entrypoint=self._entrypoint,
-            provider_options=dict(self._sandbox_provider_options),
+            provider_options=self._render_provider_option_templates(self._sandbox_provider_options),
         )
+
+    async def _upload_environment_dir_after_start(self) -> None:
+        if not self._is_separate_verifier:
+            await super()._upload_environment_dir_after_start()
+            return
+
+        # In Harbor separate-verifier mode ``environment_dir`` is the hidden
+        # tests directory, not the task's policy environment directory. Local
+        # Harbor backends build this context as the verifier image; prebuilt
+        # OpenSandbox images need the equivalent files uploaded to /tests.
+        if not should_upload_environment_dir(
+            self.environment_dir,
+            docker_image=self.task_env_config.docker_image,
+        ):
+            return
+        self.logger.debug("Uploading separate verifier context to /tests")
+        await self.upload_dir(self.environment_dir, str(EnvironmentPaths.tests_dir))
 
     async def start(self, force_build: bool) -> None:
         if force_build:
@@ -249,11 +323,7 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
 
         # Harbor's local backends bind mount these convention directories. The
         # remote provider must create all of them before agents start writing.
-        log_dirs = (
-            f"{EnvironmentPaths.agent_dir} "
-            f"{EnvironmentPaths.verifier_dir} "
-            f"{EnvironmentPaths.artifacts_dir}"
-        )
+        log_dirs = f"{EnvironmentPaths.agent_dir} {EnvironmentPaths.verifier_dir} {EnvironmentPaths.artifacts_dir}"
         result = await self._sandbox.exec(f"mkdir -p {log_dirs}", timeout_s=60)
         if result.return_code != 0:
             raise RuntimeError(
@@ -323,6 +393,7 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
         if not source.exists():
             raise FileNotFoundError(f"Source directory not found: {source}")
         sandbox = self._require_sandbox()
+        excludes = self._environment_upload_excludes if self._is_environment_upload(source) else ()
 
         remote_tar = f"{_TRANSFER_DIR}/.nemo-gym-upload-{uuid.uuid4().hex}.tar.gz"
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -330,7 +401,13 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
             with tarfile.open(local_tar, "w:gz") as tar:
                 # Archive the *contents* of source_dir so they land directly in
                 # target_dir (Harbor's upload_dir contract).
-                tar.add(source, arcname=".")
+                def _filter(member: tarfile.TarInfo) -> tarfile.TarInfo | None:
+                    relative = PurePosixPath(member.name).relative_to(".")
+                    if excludes and self._is_upload_excluded(relative):
+                        return None
+                    return member
+
+                tar.add(source, arcname=".", filter=_filter)
             await sandbox.upload(local_tar, remote_tar)
 
         quoted_target = shlex.quote(target_dir)
@@ -346,13 +423,22 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
                 result.return_code,
                 (result.stderr or "")[:500],
             )
-            await self._upload_dir_file_by_file(source, target_dir)
+            await self._upload_dir_file_by_file(source, target_dir, excludes=excludes)
 
-    async def _upload_dir_file_by_file(self, source: Path, target_dir: str):
+    async def _upload_dir_file_by_file(
+        self,
+        source: Path,
+        target_dir: str,
+        *,
+        excludes: tuple[PurePosixPath, ...] = (),
+    ):
         sandbox = self._require_sandbox()
         for path in sorted(source.rglob("*")):
             relative = path.relative_to(source)
-            remote_path = str(PurePosixPath(target_dir) / PurePosixPath(*relative.parts))
+            relative_posix = PurePosixPath(*relative.parts)
+            if excludes and self._is_upload_excluded(relative_posix):
+                continue
+            remote_path = str(PurePosixPath(target_dir) / relative_posix)
             if path.is_dir():
                 await sandbox.exec(f"mkdir -p {shlex.quote(remote_path)}", timeout_s=60)
             elif path.is_file():

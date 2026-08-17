@@ -9,6 +9,9 @@ sandbox:
       protocol: ${oc.env:OPENSANDBOX_PROTOCOL,http}
       use_server_proxy: ${oc.decode:${oc.env:OPENSANDBOX_USE_SERVER_PROXY,true}}
       ca_bundle_path: ${oc.env:OPENSANDBOX_CA_BUNDLE,null}
+      # Also bounds filesystem request bodies. Large self-contained Harbor
+      # environments can otherwise hit the provider config's 300-second limit.
+      request_timeout_s: ${oc.decode:${oc.env:OPENSANDBOX_REQUEST_TIMEOUT_S,1200}}
     # Image-specific readiness can warm lazy-pulled files before Harbor's
     # shorter task setup timeout begins.
     probe:
@@ -44,6 +47,11 @@ gym_harbor_agent:
             resource_requests:
               cpu: 0.25
               memory_mib: 512
+            # OpenSandbox Volume dictionaries. Strings support the per-task
+            # placeholders {environment_name}, {task_id}, and {session_id}.
+            volumes: ${oc.create:${oc.env:HARBOR_SANDBOX_VOLUMES,[]}}
+          # Relative task environment paths supplied by the image or a volume.
+          environment_upload_excludes: ${oc.create:${oc.env:HARBOR_ENVIRONMENT_UPLOAD_EXCLUDES,[]}}
           sandbox_metadata:
             harbor-benchmark: ${oc.env:HARBOR_BENCHMARK_NAME,harbor}
           sandbox_ttl_s: 7200

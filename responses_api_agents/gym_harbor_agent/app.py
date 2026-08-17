@@ -24,7 +24,12 @@ from pathlib import Path
 import ray
 from harbor.job import Job
 from harbor.models.job.config import DatasetConfig, JobConfig, RetryConfig
-from harbor.models.trial.config import AgentConfig, EnvironmentConfig
+from harbor.models.trial.config import (
+    AgentConfig,
+    ArtifactConfig,
+    EnvironmentConfig,
+    VerifierConfig,
+)
 from harbor.models.trial.paths import TrialPaths
 from harbor.models.trial.result import TrialResult
 from pydantic import ConfigDict, Field, PrivateAttr, field_validator, model_validator
@@ -71,10 +76,15 @@ class HarborAgentConfig(BaseResponsesAPIAgentConfig):
     dataset: DatasetConfig = Field(default_factory=DatasetConfig)
     agent: AgentConfig = Field(default_factory=AgentConfig)
     environment: EnvironmentConfig = Field(default_factory=EnvironmentConfig)
+    verifier: VerifierConfig = Field(default_factory=VerifierConfig)
+    artifacts: list[str | ArtifactConfig] = Field(default_factory=list)
     model_server: ModelServerRef
     model_base_url_env_var: str = "OPENAI_BASE_URL"
     model_api_key_env_var: str = "OPENAI_API_KEY"
     model_api_key: str
+    context_window: int = 262144
+    max_output_tokens: int = 131072
+    reasoning_field: str = "reasoning"
     environment_build_timeout_multiplier: float | None = None
 
     @field_validator("jobs_dir", mode="after")
@@ -87,22 +97,51 @@ class HarborAgentConfig(BaseResponsesAPIAgentConfig):
 
     @model_validator(mode="after")
     def validate_opencode_provider(self) -> "HarborAgentConfig":
-        if self.agent.name == "opencode" and not (self.agent.model_name or "").startswith("openai/"):
-            raise ValueError("OpenCode must use an openai/<model> name when routed through the Gym model server")
+        if self.agent.name == "opencode" and not (self.agent.model_name or "").startswith("nemo/"):
+            raise ValueError("OpenCode must use a nemo/<model> name when routed through the Gym model server")
         return self
 
-    def agent_for_model_server(self, base_url: str) -> AgentConfig:
+    def agent_for_model_server(
+        self,
+        base_url: str,
+        auxiliary_base_url: str | None = None,
+    ) -> AgentConfig:
         env = dict(self.agent.env)
         env[self.model_base_url_env_var] = base_url
         env[self.model_api_key_env_var] = self.model_api_key
 
         kwargs = copy.deepcopy(self.agent.kwargs)
         if self.agent.name == "opencode":
+            model_name = (self.agent.model_name or "").removeprefix("nemo/")
             opencode_config = kwargs.setdefault("opencode_config", {})
             provider = opencode_config.setdefault("provider", {})
-            openai_provider = provider.setdefault("openai", {})
-            options = openai_provider.setdefault("options", {})
+            nemo_provider = provider.setdefault("nemo", {})
+            nemo_provider.setdefault("npm", "@ai-sdk/openai-compatible")
+            options = nemo_provider.setdefault("options", {})
             options["baseURL"] = base_url
+            options.setdefault("apiKey", "EMPTY")  # pragma: allowlist secret
+            model = nemo_provider.setdefault("models", {}).setdefault(model_name, {})
+            model.setdefault("name", model_name)
+            model.setdefault("reasoning", True)
+            model.setdefault("tool_call", True)
+            model.setdefault("interleaved", {"field": self.reasoning_field})
+            limits = model.setdefault("limit", {})
+            limits.setdefault("context", self.context_window)
+            limits.setdefault("output", self.max_output_tokens)
+
+            # OpenCode generates session titles with its small model. Keep those
+            # utility calls on the same Gym model server, but outside the rollout
+            # correlation route so they are not trained as policy turns.
+            if auxiliary_base_url and auxiliary_base_url != base_url and "small_model" not in opencode_config:
+                auxiliary_provider_name = "nemo-auxiliary"
+                auxiliary_provider = provider.setdefault(auxiliary_provider_name, {})
+                auxiliary_provider.setdefault("npm", "@ai-sdk/openai-compatible")
+                auxiliary_options = auxiliary_provider.setdefault("options", {})
+                auxiliary_options["baseURL"] = auxiliary_base_url
+                auxiliary_options.setdefault("apiKey", "EMPTY")  # pragma: allowlist secret
+                auxiliary_model = auxiliary_provider.setdefault("models", {}).setdefault(model_name, {})
+                auxiliary_model.setdefault("name", model_name)
+                opencode_config["small_model"] = f"{auxiliary_provider_name}/{model_name}"
 
         return self.agent.model_copy(update={"env": env, "kwargs": kwargs})
 
@@ -116,6 +155,8 @@ class HarborAgentConfig(BaseResponsesAPIAgentConfig):
             retry=RetryConfig(max_retries=0),
             environment_build_timeout_multiplier=self.environment_build_timeout_multiplier,
             environment=self.environment.model_copy(update={"delete": True}),
+            verifier=self.verifier,
+            artifacts=self.artifacts,
             agents=[agent],
             datasets=[
                 self.dataset.model_copy(update={"task_names": [task_name]}),
@@ -156,7 +197,11 @@ class HarborAgent(SimpleResponsesAPIAgent):
                     self.config.model_server.name,
                     rollout_id,
                 )
-                agent = self.config.agent_for_model_server(model_base_url)
+                auxiliary_model_base_url = self.resolve_model_base_url(self.config.model_server.name)
+                agent = self.config.agent_for_model_server(
+                    model_base_url,
+                    auxiliary_base_url=auxiliary_model_base_url,
+                )
                 job_name = f"t{body.task_index}-r{body.rollout_index}"
                 if rollout_id is not None:
                     # The routed model URL is part of Harbor's job config. NRL

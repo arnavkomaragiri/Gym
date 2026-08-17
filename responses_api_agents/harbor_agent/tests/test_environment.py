@@ -94,7 +94,14 @@ def _reset_fake_provider():
     FakeProvider.instances.clear()
 
 
-def _make_environment(tmp_path: Path, *, task_env_config: Optional[TaskEnvironmentConfig] = None, **kwargs):
+def _make_environment(
+    tmp_path: Path,
+    *,
+    task_env_config: Optional[TaskEnvironmentConfig] = None,
+    environment_dir: Optional[Path] = None,
+    session_id: str = "example-task__trial-1",
+    **kwargs,
+):
     trial_dir = tmp_path / "trial"
     trial_dir.mkdir(parents=True, exist_ok=True)
     defaults = dict(
@@ -105,9 +112,9 @@ def _make_environment(tmp_path: Path, *, task_env_config: Optional[TaskEnvironme
     )
     defaults.update(kwargs)
     return NemoGymSandboxEnvironment(
-        environment_dir=tmp_path / "task" / "environment",
+        environment_dir=environment_dir or tmp_path / "task" / "environment",
         environment_name="example-task",
-        session_id="example-task__trial-1",
+        session_id=session_id,
         trial_paths=TrialPaths(trial_dir=trial_dir),
         task_env_config=task_env_config
         or TaskEnvironmentConfig(docker_image="docker.io/example/task:1.0", cpus=4, memory_mb=8192),
@@ -174,6 +181,34 @@ class TestStartStop:
         await env.start(force_build=False)
         spec = _provider().created_specs[0]
         assert spec.provider_options == {"resource_requests": {"cpu": 0.25, "memory_mib": 1024}}
+
+    @pytest.mark.asyncio
+    async def test_start_expands_task_templates_in_provider_options(self, tmp_path):
+        env = _make_environment(
+            tmp_path,
+            sandbox_provider_options={
+                "volumes": [
+                    {
+                        "name": "capsules",
+                        "mount_path": "/app/data",
+                        "sub_path": "CapsuleFolder-{task_id}",
+                    }
+                ],
+                "extensions": {"trial": "{session_id}", "task": "{environment_name}"},
+            },
+        )
+        await env.start(force_build=False)
+
+        assert _provider().created_specs[0].provider_options == {
+            "volumes": [
+                {
+                    "name": "capsules",
+                    "mount_path": "/app/data",
+                    "sub_path": "CapsuleFolder-example-task",
+                }
+            ],
+            "extensions": {"trial": "example-task__trial-1", "task": "example-task"},
+        }
 
     @pytest.mark.asyncio
     async def test_start_honours_harbor_resource_overrides(self, tmp_path):
@@ -258,6 +293,76 @@ class TestStartStop:
             assert task_file.read() == b'{"task": 1}\n'
         upload_commands = [call["command"] for call in provider.exec_calls]
         assert any("tar -xzf" in command and "-C /app" in command for command in upload_commands)
+
+    @pytest.mark.asyncio
+    async def test_separate_verifier_uploads_tests_then_accepts_policy_workspace(self, tmp_path):
+        tests_dir = tmp_path / "task" / "steps" / "rollout" / "tests"
+        tests_dir.mkdir(parents=True)
+        (tests_dir / "judge_instruction.md").write_text("Judge the submission.\n")
+        workspace = tmp_path / "policy-workspace"
+        workspace.mkdir()
+        (workspace / "REPORT.md").write_text("Policy report.\n")
+        env = _make_environment(
+            tmp_path,
+            environment_dir=tests_dir,
+            session_id="example-task__trial-1__verifier__rollout",
+            sandbox_provider_options={
+                "volumes": [
+                    {
+                        "name": "capsules",
+                        "mount_path": "/app/data",
+                        "sub_path": "CapsuleFolder-{task_id}",
+                    }
+                ]
+            },
+            task_env_config=TaskEnvironmentConfig(
+                docker_image="docker.io/example/task:1.0",
+                workdir="/app",
+            ),
+        )
+
+        await env.start(force_build=False)
+        await env.upload_dir(workspace, "/app")
+
+        provider = _provider()
+        assert provider.created_specs[0].metadata["harbor-role"] == "verifier"
+        assert provider.created_specs[0].provider_options["volumes"] == [
+            {
+                "name": "capsules",
+                "mount_path": "/app/data",
+                "sub_path": "CapsuleFolder-example-task",
+            }
+        ]
+        upload_commands = [call["command"] for call in provider.exec_calls]
+        assert any("tar -xzf" in command and "-C /tests" in command for command in upload_commands)
+        assert any("tar -xzf" in command and "-C /app" in command for command in upload_commands)
+
+    @pytest.mark.asyncio
+    async def test_start_can_exclude_volume_backed_environment_data(self, tmp_path):
+        environment_dir = tmp_path / "task" / "environment"
+        (environment_dir / "data").mkdir(parents=True)
+        (environment_dir / "task.jsonl").write_text('{"task": 1}\n')
+        (environment_dir / "data" / "large.bin").write_bytes(b"large-data")
+        env = _make_environment(
+            tmp_path,
+            task_env_config=TaskEnvironmentConfig(
+                docker_image="docker.io/example/task:1.0",
+                workdir="/app",
+            ),
+            environment_upload_excludes=["data"],
+        )
+
+        await env.start(force_build=False)
+
+        archive = next(iter(_provider().uploads.values()))
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
+            names = {member.name for member in tar.getmembers()}
+        assert "./task.jsonl" in names
+        assert not any(name == "./data" or name.startswith("./data/") for name in names)
+
+    def test_rejects_unsafe_environment_upload_excludes(self, tmp_path):
+        with pytest.raises(ValueError, match="relative paths"):
+            _make_environment(tmp_path, environment_upload_excludes=["../data"])
 
     @pytest.mark.asyncio
     async def test_stop_always_kills_sandbox(self, tmp_path):
