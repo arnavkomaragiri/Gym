@@ -1634,6 +1634,61 @@ class TestApp:
         data = response_2_2.json()
         assert data["output"][0]["content"][0]["text"] == "2"
 
+    async def test_chat_completions_structured_reasoning_replays_on_next_turn(self, monkeypatch: MonkeyPatch):
+        server = self._setup_server(monkeypatch)
+        server.config.uses_reasoning_parser = True
+        server.config.reasoning_response_field = "reasoning_content"
+
+        mock_method = AsyncMock(
+            return_value={
+                "id": "chtcmpl-123",
+                "object": "chat.completion",
+                "created": FIXED_TIME,
+                "model": "dummy_model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": "answer",
+                            "reasoning_content": "private reasoning",
+                        },
+                    }
+                ],
+            }
+        )
+        mock_client = MagicMock(spec=NeMoGymAsyncOpenAI)
+        mock_client.create_chat_completion = mock_method
+        server._clients = [mock_client]
+        request = MagicMock()
+        request.session = {"session_id": "test-session"}
+        request.headers = {}
+
+        first_response = await server.chat_completions(
+            request,
+            NeMoGymChatCompletionCreateParamsNonStreaming(messages=[{"role": "user", "content": "question"}]),
+        )
+        assistant = first_response.choices[0].message.model_dump(exclude_none=True)
+        assert assistant["content"] == "answer"
+        assert assistant["reasoning_content"] == "private reasoning"
+        assert "<think>" not in assistant["content"]
+
+        await server.chat_completions(
+            request,
+            NeMoGymChatCompletionCreateParamsNonStreaming(
+                messages=[
+                    {"role": "user", "content": "question"},
+                    assistant,
+                    {"role": "user", "content": "follow-up"},
+                ],
+            ),
+        )
+        replayed_assistant = mock_method.call_args_list[1].kwargs["messages"][1]
+        assert replayed_assistant["content"] == "answer"
+        assert replayed_assistant["reasoning_content"] == "private reasoning"
+        assert replayed_assistant["reasoning"] == "private reasoning"
+
     def test_responses_reasoning_parser(self, monkeypatch: MonkeyPatch):
         server = self._setup_server(monkeypatch)
         server.config.uses_reasoning_parser = True
@@ -3427,6 +3482,27 @@ class TestAssistantReasoningHistoryPreprocess:
         assert assistant["content"] == "\n## Action:\nact"
         assert assistant["reasoning_content"] == "reason"
         assert assistant["reasoning"] == "reason"
+
+    def test_structured_reasoning_history_is_replayed(self) -> None:
+        model = _make_reasoning_history_model(preserve_content=False)
+        body = self._body("answer")
+        body["messages"][1]["reasoning"] = "reason"
+
+        result = model._preprocess_chat_completion_create_params(MagicMock(), body)
+
+        assistant = result["messages"][1]
+        assert assistant["content"] == "answer"
+        assert assistant["reasoning_content"] == "reason"
+        assert assistant["reasoning"] == "reason"
+
+    def test_conflicting_structured_reasoning_fields_are_rejected(self) -> None:
+        model = _make_reasoning_history_model(preserve_content=False)
+        body = self._body("answer")
+        body["messages"][1]["reasoning_content"] = "first"
+        body["messages"][1]["reasoning"] = "second"
+
+        with raises(ValueError, match="conflicting reasoning fields"):
+            model._preprocess_chat_completion_create_params(MagicMock(), body)
 
     def test_preserve_mode_keeps_string_history_byte_for_byte(self) -> None:
         model = _make_reasoning_history_model(preserve_content=True)

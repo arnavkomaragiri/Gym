@@ -20,7 +20,7 @@ import logging
 import os
 from copy import deepcopy
 from time import time, time_ns
-from typing import Any, ClassVar, Dict, List, Optional, Union
+from typing import Any, ClassVar, Dict, List, Literal, Optional, Union
 
 from aiohttp.client_exceptions import ClientResponseError
 from fastapi import Request
@@ -152,6 +152,9 @@ class VLLMModelConfig(BaseResponsesAPIModelConfig):
 
     uses_reasoning_parser: bool
     uses_interleaved_reasoning: bool = True
+    # Return parsed reasoning in a structured Chat Completions field instead
+    # of reconstructing <think> tags. This is opt-in for compatible clients.
+    reasoning_response_field: Optional[Literal["reasoning_content", "reasoning"]] = None
     # Keep reconstructed assistant history byte-for-byte in ``content`` for
     # models whose validated direct-vLLM contract includes <think> tags.
     # Response parsing remains controlled independently by
@@ -477,42 +480,64 @@ class VLLMModel(SimpleResponsesAPIModel):
                 # prompt_logprobs=0,
             )
 
-        if self.config.uses_reasoning_parser and not self.config.preserve_reasoning_in_assistant_content:
+        if self.config.uses_reasoning_parser:
             for message_dict in body_dict["messages"]:
-                if message_dict.get("role") != "assistant" or "content" not in message_dict:
+                if message_dict.get("role") != "assistant":
                     continue
 
-                content = message_dict["content"]
-                if isinstance(content, str):
+                explicit_reasoning_fields = [
+                    message_dict.get(field)
+                    for field in ("reasoning_content", "reasoning")
+                    if message_dict.get(field) is not None
+                ]
+                if explicit_reasoning_fields and any(
+                    value != explicit_reasoning_fields[0] for value in explicit_reasoning_fields[1:]
+                ):
+                    raise ValueError(f"Assistant message has conflicting reasoning fields: {message_dict}")
+                reasoning_content = explicit_reasoning_fields[0] if explicit_reasoning_fields else None
+
+                content = message_dict.get("content")
+                if not self.config.preserve_reasoning_in_assistant_content and isinstance(content, str):
                     reasoning_matches, remaining_content = self._converter._extract_reasoning_from_content(content)
                     message_dict["content"] = remaining_content
-                    if reasoning_matches and self.config.uses_interleaved_reasoning:
-                        message_dict["reasoning_content"] = reasoning_matches[0]
-
-                        # TODO when NeMo RL migrates to vLLM>=0.16.0, remove the reasoning_content support above.
-                        # Starting with vLLM 0.16.0, the `reasoning_content` field has been deprecated in favor of just `reasoning`
-                        message_dict["reasoning"] = reasoning_matches[0]
-                elif isinstance(content, list):
-                    reasoning_content = None
+                    if reasoning_matches:
+                        if reasoning_content is not None and reasoning_content != reasoning_matches[0]:
+                            raise ValueError(
+                                f"Assistant message has conflicting tagged and structured reasoning: {message_dict}"
+                            )
+                        reasoning_content = reasoning_matches[0]
+                elif not self.config.preserve_reasoning_in_assistant_content and isinstance(content, list):
+                    tagged_reasoning = None
                     for content_item_dict in content:
                         reasoning_matches, remaining_content = self._converter._extract_reasoning_from_content(
                             content_item_dict["text"]
                         )
-                        assert reasoning_content is None or not reasoning_matches, (
+                        assert tagged_reasoning is None or not reasoning_matches, (
                             f"Found multiple reasoning matches in a single assistant message content item list!\nMessage: {message_dict}"
                         )
 
                         # Even though we set the reasoning content already here, we still loop through all the content item dicts for the assert above.
                         content_item_dict["text"] = remaining_content
-                        if reasoning_matches and self.config.uses_interleaved_reasoning:
-                            message_dict["reasoning_content"] = reasoning_matches[0]
-                            # See the TODO wrt reasoning_content above
-                            message_dict["reasoning"] = reasoning_matches[0]
+                        if reasoning_matches:
+                            tagged_reasoning = reasoning_matches[0]
+                    if tagged_reasoning is not None:
+                        if reasoning_content is not None and reasoning_content != tagged_reasoning:
+                            raise ValueError(
+                                f"Assistant message has conflicting tagged and structured reasoning: {message_dict}"
+                            )
+                        reasoning_content = tagged_reasoning
                 elif not content:
                     # No content or content None is a no-op
                     pass
-                else:
+                elif not self.config.preserve_reasoning_in_assistant_content:
                     raise NotImplementedError
+
+                message_dict.pop("reasoning_content", None)
+                message_dict.pop("reasoning", None)
+                if reasoning_content is not None and self.config.uses_interleaved_reasoning:
+                    # TODO when NeMo RL migrates to vLLM>=0.16.0, remove the reasoning_content compatibility field.
+                    message_dict["reasoning_content"] = reasoning_content
+                    message_dict["reasoning"] = reasoning_content
 
         # Drop a null top_logprobs on the non-capture path (caller-supplied logprobs=True).
         # vLLM treats null as "no logprobs" but a missing field as its default (0), so forwarding null is never useful.
@@ -718,11 +743,13 @@ class VLLMModel(SimpleResponsesAPIModel):
                 choice_dict["message"].pop("reasoning_content", None)
                 # See the TODO wrt reasoning_content above
                 choice_dict["message"].pop("reasoning", None)
-
-                # We wrap this here in think tags for Gym's sake and to return a valid OpenAI Chat Completions response.
-                choice_dict["message"]["content"] = self._converter._wrap_reasoning_in_think_tags(
-                    [reasoning_content]
-                ) + (choice_dict["message"].get("content") or "")
+                if self.config.reasoning_response_field:
+                    choice_dict["message"][self.config.reasoning_response_field] = reasoning_content
+                else:
+                    # Preserve the legacy response shape for clients that expect tagged content.
+                    choice_dict["message"]["content"] = self._converter._wrap_reasoning_in_think_tags(
+                        [reasoning_content]
+                    ) + (choice_dict["message"].get("content") or "")
         else:
             # See the TODO wrt reasoning_content above
             assert not (choice_dict["message"].get("reasoning_content") or choice_dict["message"].get("reasoning")), (

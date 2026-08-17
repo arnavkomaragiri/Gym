@@ -1760,7 +1760,7 @@ class TestFinalizeRolloutTokenCapture:
         self._capture(store)
         result = self._record()
 
-        built = await finalize_rollout_token_capture(result, store)
+        built = await finalize_rollout_token_capture(result, store, retire=True)
 
         [item] = result["response"]["output"]
         assert item["generation_token_ids"] == [4, 5]
@@ -1768,6 +1768,17 @@ class TestFinalizeRolloutTokenCapture:
         assert result[TOKEN_CAPTURE_KEY]["delivered_fraction"] == 1.0
         assert built is not None and built["rebuilt_response"] is not None
         assert store.read_entries("0-0") == []  # consumed records are retired
+
+    async def test_can_retain_consumed_records_for_diagnostics(self, tmp_path: Path) -> None:
+        store = TokenCaptureStore(tmp_path)
+        self._capture(store)
+        result = self._record()
+
+        built = await finalize_rollout_token_capture(result, store, retire=False)
+
+        assert built is not None and built["rebuilt_response"] is not None
+        assert result["response"]["output"][0]["generation_token_ids"] == [4, 5]
+        assert len(store.read_entries("0-0")) == 1
 
     async def test_a_rollout_that_already_has_token_ids_is_left_alone(self, tmp_path: Path) -> None:
         """A native agent's ids are what the policy sampled. A rebuild could differ, and
@@ -1779,7 +1790,7 @@ class TestFinalizeRolloutTokenCapture:
 
         with warnings.catch_warnings():
             warnings.simplefilter("error")  # and it must not be reported as a problem
-            assert await finalize_rollout_token_capture(result, store) is None
+            assert await finalize_rollout_token_capture(result, store, retire=True) is None
 
         assert result["response"]["output"] == native
         assert TOKEN_CAPTURE_KEY not in result
@@ -1796,8 +1807,8 @@ class TestFinalizeRolloutTokenCapture:
 
         with warnings.catch_warnings():
             warnings.simplefilter("error")
-            assert await finalize_rollout_token_capture(native, store) is None
-        built = await finalize_rollout_token_capture(external, store)
+            assert await finalize_rollout_token_capture(native, store, retire=True) is None
+        built = await finalize_rollout_token_capture(external, store, retire=True)
 
         assert native["response"]["output"][0]["generation_token_ids"] == [7]
         assert external["response"]["output"][0]["generation_token_ids"] == [4, 5]
@@ -1809,16 +1820,16 @@ class TestFinalizeRolloutTokenCapture:
         self._capture(store)
         result = self._record()
 
-        await finalize_rollout_token_capture(result, store)
+        await finalize_rollout_token_capture(result, store, retire=True)
         rebuilt = deepcopy(result["response"]["output"])
-        assert await finalize_rollout_token_capture(result, store) is None
+        assert await finalize_rollout_token_capture(result, store, retire=True) is None
         assert result["response"]["output"] == rebuilt
 
     async def test_no_source_means_this_caller_is_not_capturing(self, tmp_path: Path) -> None:
         result = self._record()
         with warnings.catch_warnings():
             warnings.simplefilter("error")
-            assert await finalize_rollout_token_capture(result, None) is None
+            assert await finalize_rollout_token_capture(result, None, retire=True) is None
         assert result["response"]["output"] == []
 
     async def test_a_masked_rollout_is_flagged_at_the_top_of_the_record(self, tmp_path: Path) -> None:
@@ -1829,7 +1840,7 @@ class TestFinalizeRolloutTokenCapture:
         result = self._record()
 
         with pytest.warns(UserWarning, match="marked for masking"):
-            await finalize_rollout_token_capture(result, store)
+            await finalize_rollout_token_capture(result, store, retire=True)
 
         # Top level only, so a consumer reads exactly one field to decide.
         assert result[MASK_SAMPLE_KEY] is True
@@ -1841,7 +1852,7 @@ class TestFinalizeRolloutTokenCapture:
         self._capture(store)
         result = self._record()
 
-        await finalize_rollout_token_capture(result, store)
+        await finalize_rollout_token_capture(result, store, retire=True)
 
         # Absent rather than False: a consumer that masks on presence must not mask everything.
         assert MASK_SAMPLE_KEY not in result
@@ -1862,7 +1873,7 @@ class TestFinalizeRolloutTokenCapture:
         result = self._record()
 
         with pytest.warns(UserWarning, match="marked for masking"):
-            await finalize_rollout_token_capture(result, store)
+            await finalize_rollout_token_capture(result, store, retire=True)
 
         assert result[MASK_SAMPLE_KEY] is True
         assert "log-prob/token length mismatch" in result[TOKEN_CAPTURE_KEY]["error"]
@@ -1875,7 +1886,7 @@ class TestFinalizeRolloutTokenCapture:
         del result[ROLLOUT_INDEX_KEY_NAME]
 
         with pytest.warns(UserWarning, match="carries no id"):
-            built = await finalize_rollout_token_capture(result, TokenCaptureStore(tmp_path))
+            built = await finalize_rollout_token_capture(result, TokenCaptureStore(tmp_path), retire=True)
 
         # Masked, not just reported: unmasked it reaches the trainer with no ids and fails there.
         assert result[MASK_SAMPLE_KEY] is True
@@ -1886,7 +1897,7 @@ class TestFinalizeRolloutTokenCapture:
         result = self._record()
 
         with pytest.warns(UserWarning, match="none were recorded"):
-            built = await finalize_rollout_token_capture(result, TokenCaptureStore(tmp_path))
+            built = await finalize_rollout_token_capture(result, TokenCaptureStore(tmp_path), retire=True)
 
         assert result[MASK_SAMPLE_KEY] is True
         assert result[TOKEN_CAPTURE_KEY]["error"] == "nothing recorded"
@@ -1909,7 +1920,7 @@ class TestFinalizeRolloutTokenCapture:
         result = self._record()
 
         with pytest.warns(UserWarning, match="could not read the records"):
-            built = await finalize_rollout_token_capture(result, _Failing())
+            built = await finalize_rollout_token_capture(result, _Failing(), retire=True)
 
         assert result[MASK_SAMPLE_KEY] is True
         assert "ConnectionError" in result[TOKEN_CAPTURE_KEY]["error"]

@@ -48,6 +48,12 @@ from nemo_gym.token_id_capture.protocols import TokenSource
 # chain count, quarantined fraction, delivered token fraction, and why a rollout was masked.
 TOKEN_CAPTURE_KEY = "_ng_token_capture"
 
+# Exact model invocations for training. Each Responses payload is one causal-attention
+# segment with the prompt and generation tokenization that the model server actually
+# decoded. Consumers may concatenate the segments physically, but must preserve their
+# attention boundaries.
+TRAINING_RESPONSES_KEY = "_ng_training_responses"
+
 # The one field a consumer reads to decide whether to drop this rollout from the loss. It sits at
 # the top of the record, not inside TOKEN_CAPTURE_KEY, so nothing has to know this feature exists
 # to find it. The name is the one already used for the same request elsewhere in the repo.
@@ -82,7 +88,12 @@ def _unusable(result: dict, error: str, message: str) -> dict:
     return {"rebuilt_response": None, MASK_SAMPLE_KEY: True, "error": error, "metrics": metrics}
 
 
-async def finalize_rollout_token_capture(result: dict, source: TokenSource | None) -> dict | None:
+async def finalize_rollout_token_capture(
+    result: dict,
+    source: TokenSource | None,
+    *,
+    retire: bool,
+) -> dict | None:
     """Rebuild one finished rollout record's ``response.output`` from its recorded token ids.
 
     Call this once per record, after the harness and verifier are done with it. Mutates ``result``
@@ -91,9 +102,10 @@ async def finalize_rollout_token_capture(result: dict, source: TokenSource | Non
     harness's rollout exactly as it reads a native agent's, with no sidecar payload and no
     per-agent branch.
 
-    ``source`` is where records are read from and retired, and ``None`` means this caller is not
-    capturing, so there is nothing to do. Idempotent: a rollout already rebuilt carries token ids
-    and is left alone on a second call.
+    ``source`` is where records are read from and optionally retired, and ``None`` means this
+    caller is not capturing, so there is nothing to do. ``retire=False`` preserves successfully
+    consumed records for diagnostics without changing the rebuilt response. Idempotent: a rollout
+    already rebuilt carries token ids and is left alone on a second call.
 
     Never raises. A rollout whose tokens are missing or ambiguous is marked for masking, since the
     alternative is training on a trajectory with a hole in it.
@@ -142,11 +154,14 @@ async def finalize_rollout_token_capture(result: dict, source: TokenSource | Non
         )
 
     projected = built["rebuilt_response"]
+    training_responses = built.get("rebuilt_responses") or []
     if projected is not None:
         if isinstance(result.get("response"), dict):
             result["response"]["output"] = projected["output"]
         else:
             result["response"] = projected
+    if training_responses:
+        result[TRAINING_RESPONSES_KEY] = training_responses
 
     # Carry what the build dropped onto the record. Without this the quarantine and delivered-token
     # fractions are computed and discarded, and a rollout that trained on one of five calls looks
@@ -168,7 +183,7 @@ async def finalize_rollout_token_capture(result: dict, source: TokenSource | Non
     # Retire on consume. Rollouts record hundreds of KB each and a store appends, so keeping
     # consumed records both grows without bound and lets a later run with the same id append onto
     # them. A failed build keeps its records: they are the only evidence of why it failed.
-    if projected is not None:
+    if projected is not None and retire:
         try:
             await source.drop(rollout_id)
         except Exception:

@@ -97,6 +97,9 @@ class TokenIdCaptureSettings(BaseModel):
     # has Gym reading a store nothing wrote to, warning per rollout and reporting healthy runs as
     # failed rebuilds.
     rebuild_response: bool = True
+    # Preserve successfully consumed records for diagnosis instead of deleting them. This can
+    # retain large prompt/token payloads, so production runs should leave it disabled.
+    retain_consumed: bool = False
 
 
 class TokenIdCaptureConfig(BaseModel):

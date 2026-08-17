@@ -408,10 +408,20 @@ class ResponsesConverter(BaseModel):
         response_output = []
 
         content = message_dict.get("content") or ""
+        reasoning_matches = []
         if self.uses_reasoning_parser:
-            reasoning_matches, content = self._extract_reasoning_from_content(content)
-        else:
-            reasoning_matches = []
+            structured_reasoning = [
+                message_dict.get(field)
+                for field in ("reasoning_content", "reasoning")
+                if message_dict.get(field) is not None
+            ]
+            if structured_reasoning and any(value != structured_reasoning[0] for value in structured_reasoning[1:]):
+                raise ValueError(f"Assistant message has conflicting reasoning fields: {message_dict}")
+            reasoning_matches = [structured_reasoning[0]] if structured_reasoning and structured_reasoning[0] else []
+            tagged_reasoning, content = self._extract_reasoning_from_content(content)
+            for reasoning_text in tagged_reasoning:
+                if reasoning_text not in reasoning_matches:
+                    reasoning_matches.append(reasoning_text)
         if reasoning_matches:
             reasoning_item = NeMoGymResponseReasoningItem(
                 id=f"rs_{uuid4().hex}",

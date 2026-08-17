@@ -158,6 +158,14 @@ def test_config_keeps_settings_when_capture_is_off(tmp_path):
     assert cfg.build_sink() is None
 
 
+def test_config_retains_consumed_records_only_when_requested(tmp_path):
+    default = TokenIdCaptureConfig.model_validate(_block(dir=str(tmp_path)))
+    retained = TokenIdCaptureConfig.model_validate(_block(dir=str(tmp_path), retain_consumed=True))
+
+    assert default.token_id_capture.retain_consumed is False
+    assert retained.token_id_capture.retain_consumed is True
+
+
 def test_config_warns_rather_than_fails_on_a_sink_beside_a_directory(caplog):
     """Nothing is lost, the directory is just never read, but someone expecting files on disk
     will not find any."""

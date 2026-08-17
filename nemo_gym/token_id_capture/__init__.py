@@ -42,6 +42,7 @@ from nemo_gym.token_id_capture.builder import (
     per_request,
     prefix_merging,
     project_chain_to_output_items,
+    project_independent_call_responses,
     project_main_chain_response,
     run_builder,
 )
@@ -96,6 +97,7 @@ __all__ = [
     "per_request",
     "prefix_merging",
     "project_chain_to_output_items",
+    "project_independent_call_responses",
     "project_main_chain_response",
     "run_builder",
     "assert_prefix_contiguity",

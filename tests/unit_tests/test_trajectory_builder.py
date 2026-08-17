@@ -454,3 +454,39 @@ def test_a_chain_that_breaks_is_split_and_reported():
     assert len(out.chains) > 1
     assert out.notes.delivered_fraction < 1.0
     assert_prefix_contiguity(project_main_chain_response("r0", out, model="m"))
+
+
+def test_retokenized_generation_suffix_is_masked_without_splitting_chain():
+    ancestor = _entry("ancestor", [1, 2], [3, 4])
+    first = _entry("first", [1, 2, 3, 4, 5], list(range(10, 20)))
+    # The next call preserves 80% of the sampled generation tokens, then uses
+    # a different tokenization for the same trailing text before its tool result.
+    # The older ancestor is still an exact prefix, but the much longer near-prefix
+    # from the immediately preceding call must win.
+    second = _entry(
+        "second",
+        [1, 2, 3, 4, 5, *range(10, 18), 90, 91, 92],
+        [30],
+    )
+
+    out = prefix_merging([second, ancestor, first])
+    response = project_main_chain_response("r0", out, model="m")
+    generated = [item for item in response["output"] if item.get("generation_token_ids") is not None]
+
+    assert out.notes.chains == 1
+    assert out.notes.retokenized_boundaries == 1
+    assert out.notes.retokenized_tokens_masked == 2
+    assert out.notes.generated_tokens_delivered == 11
+    assert generated[1]["generation_token_ids"] == list(range(10, 18))
+    assert generated[2]["prompt_token_ids"] == second.prompt_token_ids
+    assert_prefix_contiguity(response)
+
+
+def test_large_generation_rewrite_remains_a_separate_chain():
+    first = _entry("first", [1, 2], list(range(10, 20)))
+    second = _entry("second", [1, 2, 10, 11, 90, 91, 92, 93, 94, 95, 96, 97, 98], [30])
+
+    out = prefix_merging([first, second])
+
+    assert out.notes.chains == 2
+    assert out.notes.retokenized_boundaries == 0

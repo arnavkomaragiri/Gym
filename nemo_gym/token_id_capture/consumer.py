@@ -34,6 +34,7 @@ from pathlib import Path
 
 from nemo_gym.token_id_capture.builder import (
     assert_prefix_contiguity,
+    project_independent_call_responses,
     project_main_chain_response,
     run_builder,
 )
@@ -94,6 +95,9 @@ def _assemble(
             chain.validate()
         response = project_main_chain_response(rollout_id, out, model=model)
         assert_prefix_contiguity(response)
+        responses = project_independent_call_responses(rollout_id, entries, out, model=model)
+        for call_response in responses:
+            assert_prefix_contiguity(call_response)
     except (AssertionError, ValueError, KeyError, IndexError, TypeError) as error:
         logger.warning(
             "Could not build a trajectory for rollout %s from %d captured call(s): %s",
@@ -111,6 +115,15 @@ def _assemble(
         }
 
     notes = out.notes
+    unused_retry_ids = set(notes.unused_retry_calls)
+    consumable_generated_tokens = sum(
+        len(entry.generation_token_ids)
+        for entry in entries
+        if entry.generation_token_ids and entry.model_call_id not in unused_retry_ids
+    )
+    delivered_generated_tokens = sum(
+        len(item.get("generation_token_ids") or []) for call_response in responses for item in call_response["output"]
+    )
     # Surface what the build dropped, so a rollout that trained on one of five calls does not look
     # like one that trained on all five.
     metrics = {
@@ -118,19 +131,27 @@ def _assemble(
         "chains": notes.chains,
         "quarantined_calls": len(out.quarantined),
         "quarantined_fraction": round(len(out.quarantined) / len(entries), 4) if entries else 0.0,
-        "delivered_fraction": notes.delivered_fraction,
+        "delivered_fraction": (
+            round(delivered_generated_tokens / consumable_generated_tokens, 4) if consumable_generated_tokens else 0.0
+        ),
         "generated_tokens_captured": notes.generated_tokens_captured,
-        "generated_tokens_delivered": notes.generated_tokens_delivered,
+        "generated_tokens_delivered": delivered_generated_tokens,
+        "training_sequences": len(responses),
+        "legacy_main_chain_delivered_fraction": notes.delivered_fraction,
         # Calls the model returned with no generated tokens. They carry no training signal and are
         # kept out of the chain; a non-zero count usually means the output budget or a content
         # filter is cutting generations off.
         "empty_generation_calls": len(notes.empty_generation_calls),
+        "retokenized_boundaries": notes.retokenized_boundaries,
+        "retokenized_tokens_masked": 0,
+        "legacy_main_chain_retokenized_tokens_masked": notes.retokenized_tokens_masked,
     }
     unresolved = notes.unresolved_retries
     return {
         "rollout_id": rollout_id,
         "builder": builder,
         "rebuilt_response": response,
+        "rebuilt_responses": responses,
         "metrics": metrics,
         # A retry of the final call leaves two generations with no way to tell which one the client
         # received. Training on the wrong one is silently off-policy, so the rollout is masked.

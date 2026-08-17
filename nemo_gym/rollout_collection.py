@@ -806,7 +806,8 @@ class RolloutCollectionHelper(BaseModel):
         # reads through its own transport. The store is still written and still cleared in that last
         # case, since clearing is about a rerun reusing a deterministic id, not about readback.
         token_source = None
-        if token_capture_dirs and TokenIdCaptureConfig.model_validate(global_config).token_id_capture.rebuild_response:
+        token_capture_config = TokenIdCaptureConfig.model_validate(global_config).token_id_capture
+        if token_capture_dirs and token_capture_config.rebuild_response:
             token_source = TokenCaptureStore(token_capture_dirs[0])
 
         # Clear only rows about to be dispatched, after resume has assigned retry suffixes. This also
@@ -855,7 +856,11 @@ class RolloutCollectionHelper(BaseModel):
             # Build this rollout's captured tokens into a trajectory and attach it (no-op when token
             # capture is off or no tokens were captured for the rollout). Never alters output/reward.
             # A caller that drives run_examples itself calls the same function on each record.
-            await finalize_rollout_token_capture(result, token_source)
+            await finalize_rollout_token_capture(
+                result,
+                token_source,
+                retire=not token_capture_config.retain_consumed,
+            )
 
             no_persist = bool(result.get(NG_NO_PERSIST_KEY))
             failure_class = result.get(NG_FAILURE_CLASS_KEY)

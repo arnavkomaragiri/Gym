@@ -415,6 +415,8 @@ class NeMoGymChatCompletionMessageToolCall(ChatCompletionMessageToolCall):
 
 class NeMoGymChatCompletionMessage(ChatCompletionMessage):
     tool_calls: Optional[List[NeMoGymChatCompletionMessageToolCall]] = None
+    reasoning_content: Optional[str] = None
+    reasoning: Optional[str] = None
 
 
 class NeMoGymChatCompletionMessageForTraining(NeMoGymChatCompletionMessage, TokenIDLogProbMixin):
@@ -484,6 +486,8 @@ class NeMoGymChatCompletionAssistantMessageParam(ChatCompletionAssistantMessageP
     # Override the iterable which is annoying to work with.
     content: Union[str, List[ContentArrayOfContentPart], None]
     tool_calls: Optional[List[NeMoGymChatCompletionMessageToolCallParam]] = None
+    reasoning_content: Optional[str]
+    reasoning: Optional[str]
 
 
 class NeMoGymChatCompletionAssistantMessageForTrainingParam(

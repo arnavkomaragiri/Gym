@@ -20,14 +20,13 @@ The builder is a pure function over a list of ``TokenEntry`` records (whatever a
 
   per_request     assumes nothing about how the calls relate; every call becomes
                   its own training sequence. Always valid.
-  prefix_merging  chains calls by the token-prefix relationship: each call is
-                  parented to the earlier call whose full token sequence (prompt
-                  plus generation) is the longest prefix of this call's prompt.
-                  This rebuilds a multi-turn, append-only rollout into one chain.
-                  A prompt that no longer extends any earlier call starts a new
-                  root (a compacted or rewritten context). Two candidate parents
-                  with identical sequences are ambiguous, so that subtree is
-                  quarantined rather than guessed.
+  prefix_merging  chains calls by their token-prefix relationship. It also
+                  handles text APIs that re-tokenize the end of a sampled turn:
+                  the token-identical part remains generated and the changed
+                  suffix becomes masked context. A prompt that no longer extends
+                  most of an earlier call starts a new root (a compacted or
+                  rewritten context). Equally good candidate parents are
+                  ambiguous, so that subtree is quarantined rather than guessed.
 
 Both are order-independent: they do not depend on arrival order or any sequence
 number. ``prefix_merging`` processes entries by increasing prompt length, which
@@ -51,6 +50,13 @@ from nemo_gym.token_id_capture.records import TokenEntry
 class ChainLink:
     entry: TokenEntry
     interstitial: list[int]  # prompt tokens added since the parent (tool output, new user turn); mask 0
+    # A later prompt may re-tokenize the end of this generation even when it
+    # preserves the decoded text. Keep only the token-identical prefix so the
+    # later call can start from its exact sampled prompt.
+    generation_length: int | None = None
+
+    def kept_generation_length(self) -> int:
+        return len(self.entry.generation_token_ids) if self.generation_length is None else self.generation_length
 
 
 @dataclass
@@ -69,6 +75,11 @@ class Chain:
                 raise ValueError(
                     f"log-prob/token length mismatch on {link.entry.model_call_id}: "
                     f"{len(log_probs)} vs {len(generated)}"
+                )
+            if not 0 <= link.kept_generation_length() <= len(generated):
+                raise ValueError(
+                    f"invalid generation prefix on {link.entry.model_call_id}: "
+                    f"{link.kept_generation_length()} of {len(generated)} tokens"
                 )
 
 
@@ -92,8 +103,17 @@ class BuildNotes:
     # Calls whose sibling was a retry the harness may or may not have kept. Unresolvable for the
     # final call of a rollout, because no later call names the survivor.
     unresolved_retries: list[str] = field(default_factory=list)
+    # Retry responses that a later request proves the harness did not consume.
+    # They are not policy actions in the episode delivered to the harness and must
+    # not appear in the independent-call training payload.
+    unused_retry_calls: list[str] = field(default_factory=list)
     # Calls the model returned with no generated tokens, kept out of the chain entirely.
     empty_generation_calls: list[str] = field(default_factory=list)
+    # A text-based API can decode and re-tokenize a sampled turn before
+    # sending it back. Those boundaries remain trainable on either side, but
+    # the token-changed suffix itself must be masked.
+    retokenized_boundaries: int = 0
+    retokenized_tokens_masked: int = 0
 
 
 @dataclass
@@ -121,23 +141,50 @@ class _Node:
     entry: TokenEntry
     cumulative: list[int]  # prompt + generation for this call
     parent: "_Node | None" = None
+    parent_prefix_length: int = 0
     children: list["_Node"] = field(default_factory=list)
     quarantined: bool = False
 
 
-def _infer_parent(prompt: list[int], candidates: list["_Node"]) -> tuple["_Node | None", bool]:
-    """Fallback when no verified parent link is recorded: the earlier call whose
-    cumulative sequence is the longest prefix of this prompt.
+def _common_prefix_length(left: list[int], right: list[int]) -> int:
+    for index, (left_token, right_token) in enumerate(zip(left, right)):
+        if left_token != right_token:
+            return index
+    return min(len(left), len(right))
 
-    Two candidates with identical cumulative sequences are indistinguishable, so
-    the subtree is quarantined rather than guessed.
+
+def _infer_parent(prompt: list[int], candidates: list["_Node"]) -> tuple["_Node | None", bool, int]:
+    """Choose the earlier call that preserves the longest prefix of this prompt.
+
+    Exact extensions are preferred naturally by their full cumulative length.
+    A near-prefix can win over a shorter exact ancestor when only the end of the
+    immediately preceding generation was re-tokenized. Equal-length candidates
+    are indistinguishable, so the subtree is quarantined rather than guessed.
     """
-    matches = [n for n in candidates if _is_prefix(n.cumulative, prompt)]
+    matches = [
+        (candidate, len(candidate.cumulative)) for candidate in candidates if _is_prefix(candidate.cumulative, prompt)
+    ]
+
+    # Text-based APIs decode a sampled turn and later re-tokenize that same
+    # text as history. If the difference is confined to the end of the prior
+    # generation, retain its token-identical prefix and let the child's exact
+    # prompt replace the changed suffix as masked context. Requiring the whole
+    # prior prompt plus most of its generation prevents context compaction or
+    # ordinary history rewrites from being stitched this way.
+    for candidate in candidates:
+        generated = candidate.entry.generation_token_ids
+        if _is_prefix(candidate.cumulative, prompt) or not generated or len(prompt) <= len(candidate.cumulative):
+            continue
+        prefix_length = _common_prefix_length(candidate.cumulative, prompt)
+        generated_prefix_length = prefix_length - len(candidate.entry.prompt_token_ids)
+        if generated_prefix_length >= 0.8 * len(generated) and len(generated) - generated_prefix_length <= 1024:
+            matches.append((candidate, prefix_length))
+
     if not matches:
-        return None, False
-    best_len = max(len(n.cumulative) for n in matches)
-    best = [n for n in matches if len(n.cumulative) == best_len]
-    return best[0], len(best) > 1
+        return None, False, 0
+    best_len = max(prefix_length for _, prefix_length in matches)
+    best = [candidate for candidate, prefix_length in matches if prefix_length == best_len]
+    return best[0], len(best) > 1, best_len
 
 
 def prefix_merging(entries: list[TokenEntry]) -> BuildOutput:
@@ -164,9 +211,10 @@ def prefix_merging(entries: list[TokenEntry]) -> BuildOutput:
     for entry in ordered:
         prompt = list(entry.prompt_token_ids)
         node = _Node(entry=entry, cumulative=prompt + list(entry.generation_token_ids))
-        parent, ambiguous = _infer_parent(prompt, nodes)
+        parent, ambiguous, parent_prefix_length = _infer_parent(prompt, nodes)
         if parent is not None:
             node.parent = parent
+            node.parent_prefix_length = parent_prefix_length
             if ambiguous:
                 # Two candidate parents with identical sequences: quarantine rather than guess.
                 node.quarantined = True
@@ -186,6 +234,7 @@ def prefix_merging(entries: list[TokenEntry]) -> BuildOutput:
     # survivor, so that case is flagged as unresolved rather than tie-broken silently, and the
     # caller masks the rollout instead of training on a generation the client may never have received.
     unresolved_retries: list[str] = []
+    unused_retry_calls: list[str] = []
     # Group by parent identity. Roots share the ROOTS key on purpose: a retry of a rollout's first
     # call produces two roots with the same prompt, and they have to be compared as siblings like
     # any other pair. An explicit key says so, where id(None) would leave it looking accidental.
@@ -210,6 +259,7 @@ def prefix_merging(entries: list[TokenEntry]) -> BuildOutput:
                 if node not in keep and not node.quarantined:
                     node.quarantined = True
                     quarantined.append(node.entry.model_call_id)
+                    unused_retry_calls.append(node.entry.model_call_id)
 
     chains: list[Chain] = []
 
@@ -220,11 +270,21 @@ def prefix_merging(entries: list[TokenEntry]) -> BuildOutput:
                 return
             root = path[0]
             chain = Chain(chain_id="", root_prompt=list(root.entry.prompt_token_ids))
-            prev_cumulative = list(root.entry.prompt_token_ids)
             for step, p in enumerate(path):
-                interstitial = [] if step == 0 else list(p.entry.prompt_token_ids[len(prev_cumulative) :])
-                chain.links.append(ChainLink(entry=p.entry, interstitial=interstitial))
-                prev_cumulative = list(p.entry.prompt_token_ids) + list(p.entry.generation_token_ids)
+                interstitial = [] if step == 0 else list(p.entry.prompt_token_ids[p.parent_prefix_length :])
+                generation_length = None
+                if step + 1 < len(path):
+                    child = path[step + 1]
+                    kept = child.parent_prefix_length - len(p.entry.prompt_token_ids)
+                    if kept < len(p.entry.generation_token_ids):
+                        generation_length = kept
+                chain.links.append(
+                    ChainLink(
+                        entry=p.entry,
+                        interstitial=interstitial,
+                        generation_length=generation_length,
+                    )
+                )
             chains.append(chain)
             return
         for child in node.children:
@@ -273,8 +333,9 @@ def prefix_merging(entries: list[TokenEntry]) -> BuildOutput:
                 c.chain_id = f"branch-{branch}"
                 branch += 1
 
-    delivered = sum(len(link.entry.generation_token_ids) for link in main.links) if chains else 0
+    delivered = sum(link.kept_generation_length() for link in main.links) if chains else 0
     captured = sum(len(e.generation_token_ids) for e in entries)
+    retokenized_links = [link for link in main.links if link.generation_length is not None] if chains else []
     notes = BuildNotes(
         builder="prefix_merging",
         roots=len(roots),
@@ -283,7 +344,12 @@ def prefix_merging(entries: list[TokenEntry]) -> BuildOutput:
         generated_tokens_delivered=delivered,
         delivered_fraction=round(delivered / captured, 4) if captured else 0.0,
         unresolved_retries=unresolved_retries,
+        unused_retry_calls=unused_retry_calls,
         empty_generation_calls=empty_generation,
+        retokenized_boundaries=len(retokenized_links),
+        retokenized_tokens_masked=sum(
+            len(link.entry.generation_token_ids) - link.kept_generation_length() for link in retokenized_links
+        ),
     )
     return BuildOutput(chains=chains, quarantined=quarantined, notes=notes)
 
@@ -316,6 +382,9 @@ def project_chain_to_output_items(chain: Chain) -> list[dict]:
     for step, link in enumerate(chain.links):
         cumulative = cumulative + (link.interstitial if step > 0 else [])
         entry = link.entry
+        generation_length = link.kept_generation_length()
+        generation_token_ids = list(entry.generation_token_ids[:generation_length])
+        generation_log_probs = list(entry.generation_log_probs[:generation_length])
         content_items = [dict(item) for item in (entry.output_items or [])]
         index = entry.token_item_index
         if index is not None and 0 <= index < len(content_items):
@@ -330,8 +399,8 @@ def project_chain_to_output_items(chain: Chain) -> list[dict]:
         if content_items:
             for item in generated:
                 item["prompt_token_ids"] = list(cumulative)
-                item["generation_token_ids"] = list(entry.generation_token_ids)
-                item["generation_log_probs"] = list(entry.generation_log_probs)
+                item["generation_token_ids"] = generation_token_ids
+                item["generation_log_probs"] = generation_log_probs
                 if entry.routed_experts is not None:
                     item["routed_experts"] = entry.routed_experts
             items.extend(content_items)
@@ -339,13 +408,13 @@ def project_chain_to_output_items(chain: Chain) -> list[dict]:
             item = {
                 "type": "message",
                 "prompt_token_ids": list(cumulative),
-                "generation_token_ids": list(entry.generation_token_ids),
-                "generation_log_probs": list(entry.generation_log_probs),
+                "generation_token_ids": generation_token_ids,
+                "generation_log_probs": generation_log_probs,
             }
             if entry.routed_experts is not None:
                 item["routed_experts"] = entry.routed_experts
             items.append(item)
-        cumulative = cumulative + list(entry.generation_token_ids)
+        cumulative = cumulative + generation_token_ids
     return items
 
 
@@ -373,6 +442,40 @@ def project_main_chain_response(rollout_id: str, out: BuildOutput, model: str = 
         "output": output,
         "usage": {"input_tokens": n_in, "output_tokens": n_out},
     }
+
+
+def project_independent_call_responses(
+    rollout_id: str,
+    entries: list[TokenEntry],
+    out: BuildOutput,
+    model: str = "",
+) -> list[dict]:
+    """Project every consumed call with its exact sampled prompt and generation.
+
+    Calls are independent causal-attention segments. Unlike the legacy main-chain
+    projection, this never truncates an earlier generation or rewrites a later
+    prompt to make the two tokenizations contiguous. Context compactions and
+    sub-agent roots are ordinary additional segments.
+    """
+    unused_retries = set(out.notes.unused_retry_calls)
+    usable = [entry for entry in entries if entry.generation_token_ids and entry.model_call_id not in unused_retries]
+    responses: list[dict] = []
+    for index, entry in enumerate(sorted(usable, key=lambda item: (item.created_at, item.model_call_id))):
+        chain = per_request([entry]).chains[0]
+        output = project_chain_to_output_items(chain)
+        responses.append(
+            {
+                "id": f"call-{rollout_id}-{index}",
+                "model": model or entry.model,
+                "object": "response",
+                "output": output,
+                "usage": {
+                    "input_tokens": len(entry.prompt_token_ids),
+                    "output_tokens": len(entry.generation_token_ids),
+                },
+            }
+        )
+    return responses
 
 
 def assert_prefix_contiguity(response: dict) -> None:
