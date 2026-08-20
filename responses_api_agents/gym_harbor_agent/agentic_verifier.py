@@ -10,6 +10,7 @@ import json
 import math
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, override
 
@@ -30,6 +31,106 @@ _OPENCODE_API_PACKAGES = {
     "chat_completions": "@ai-sdk/openai-compatible",
     "responses": "@ai-sdk/openai",
 }
+_PREINSTALLED_OPENCODE_IMPORT_PATH = "responses_api_agents.gym_harbor_agent.audited_opencode:PreinstalledOpenCode"
+_AUDITED_OPENCODE_IMPORT_PATH = "responses_api_agents.gym_harbor_agent.audited_opencode:AuditedOpenCode"
+_OPENCODE_IMPORT_PATHS = {_PREINSTALLED_OPENCODE_IMPORT_PATH, _AUDITED_OPENCODE_IMPORT_PATH}
+SCORE_INTEGRITY_FILENAME = "score_integrity.json"
+
+
+@dataclass(frozen=True)
+class ScoreIntegrityResult:
+    """Host-side verdict over the judge's score tool-call protocol."""
+
+    terminal: bool
+    accepted_call_count: int
+    reason: str
+
+    def to_json(self) -> str:
+        return (
+            json.dumps(
+                {
+                    "terminal": self.terminal,
+                    "accepted_call_count": self.accepted_call_count,
+                    "reason": self.reason,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        )
+
+
+def _contains_accepted_result(value: Any) -> bool:
+    if isinstance(value, dict):
+        if value.get("accepted") is True:
+            return True
+        return any(_contains_accepted_result(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_accepted_result(item) for item in value)
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            return False
+        return _contains_accepted_result(decoded)
+    return False
+
+
+def _validate_score_trajectory(trajectory_path: Path) -> ScoreIntegrityResult:
+    if not trajectory_path.is_file():
+        return ScoreIntegrityResult(False, 0, "judge trajectory is missing")
+    try:
+        raw = json.loads(trajectory_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        return ScoreIntegrityResult(False, 0, f"judge trajectory is unreadable: {type(exc).__name__}")
+    steps = raw.get("steps") if isinstance(raw, dict) else None
+    if not isinstance(steps, list):
+        return ScoreIntegrityResult(False, 0, "judge trajectory has no steps list")
+
+    all_tool_call_ids: list[str] = []
+    accepted_score_call_ids: list[str] = []
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        tool_calls = step.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            continue
+        observation = step.get("observation")
+        results = observation.get("results", []) if isinstance(observation, dict) else []
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            tool_call_id = tool_call.get("tool_call_id")
+            function_name = tool_call.get("function_name")
+            if not isinstance(tool_call_id, str):
+                continue
+            all_tool_call_ids.append(tool_call_id)
+            if not isinstance(function_name, str) or not (
+                function_name == "score_solution" or function_name.endswith("_score_solution")
+            ):
+                continue
+            accepted = any(
+                isinstance(result, dict)
+                and result.get("source_call_id") == tool_call_id
+                and _contains_accepted_result(result.get("content"))
+                for result in results
+            )
+            if accepted:
+                accepted_score_call_ids.append(tool_call_id)
+
+    if len(accepted_score_call_ids) != 1:
+        return ScoreIntegrityResult(
+            False,
+            len(accepted_score_call_ids),
+            f"expected exactly one accepted score_solution call, found {len(accepted_score_call_ids)}",
+        )
+    if not all_tool_call_ids or all_tool_call_ids[-1] != accepted_score_call_ids[0]:
+        return ScoreIntegrityResult(
+            False,
+            1,
+            "accepted score_solution call was not the judge's final tool call",
+        )
+    return ScoreIntegrityResult(True, 1, "")
 
 
 class OpenCodeProviderConfig(BaseModel, extra="forbid"):
@@ -197,8 +298,8 @@ class AgenticVerifier(BaseVerifier):
         provider_config = self.config.judge_opencode_provider
         if provider_config is None:
             return judge_agent
-        if judge_agent.name != "opencode":
-            raise ValueError("judge_opencode_provider requires judge_agent.name='opencode'")
+        if judge_agent.name != "opencode" and judge_agent.import_path not in _OPENCODE_IMPORT_PATHS:
+            raise ValueError("judge_opencode_provider requires an OpenCode judge agent")
         if not judge_agent.model_name:
             raise ValueError("judge_opencode_provider requires judge_agent.model_name")
 
@@ -263,6 +364,12 @@ class AgenticVerifier(BaseVerifier):
             rewards[key] = value
         return rewards
 
+    def _score_integrity(self, judge_logs_dir: Path) -> ScoreIntegrityResult:
+        result = _validate_score_trajectory(judge_logs_dir / "trajectory.json")
+        integrity_path = self.trial_paths.verifier_dir / SCORE_INTEGRITY_FILENAME
+        integrity_path.write_text(result.to_json())
+        return result
+
     @override
     async def verify(self) -> VerifierResult:
         if "__verifier__" not in self.environment.session_id:
@@ -314,4 +421,8 @@ class AgenticVerifier(BaseVerifier):
 
         if run_error is not None:
             raise run_error
+        score_integrity = self._score_integrity(judge_logs_dir)
+        if not score_integrity.terminal:
+            self.logger.error("Rejecting non-terminal agentic judge score: %s", score_integrity.reason)
+            return VerifierResult(rewards={"reward": 0.0})
         return VerifierResult(rewards=self._parse_rewards())

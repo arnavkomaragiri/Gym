@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Layer this after harbor_agent.yaml and harbor_agent_opensandbox.yaml.
+# Classification stays in the Gym server; neither the honeypot path nor its
+# purpose is added to the policy prompt or sandbox environment.
+gym_harbor_agent:
+  responses_api_agents:
+    gym_harbor_agent:
+      agent:
+        name: null
+        import_path: responses_api_agents.gym_harbor_agent.audited_opencode:AuditedOpenCode
+        kwargs:
+          use_preinstalled: ${oc.decode:${oc.env:HARBOR_OPENCODE_PREINSTALLED,true}}
+
+      file_access_audit:
+        honeypot_path: ${oc.env:HARBOR_HONEYPOT_PATH}
+        additional_honeypot_paths: ${oc.create:${oc.env:HARBOR_ADDITIONAL_HONEYPOT_PATHS,[]}}

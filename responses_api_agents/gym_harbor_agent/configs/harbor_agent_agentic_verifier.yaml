@@ -13,9 +13,13 @@ gym_harbor_agent:
         kwargs:
           config:
             judge_agent:
-              name: opencode
+              name: null
+              import_path: responses_api_agents.gym_harbor_agent.audited_opencode:AuditedOpenCode
               model_name: ${oc.env:RUBRIC_MODEL}
               env: {}
+              kwargs:
+                use_preinstalled: true
+                trace_filename: .judge-fs.trace
               mcp_servers:
                 - name: harbor_score
                   transport: stdio
@@ -35,10 +39,19 @@ gym_harbor_agent:
             setup_timeout_sec: 900
             run_timeout_sec: 1400
 
+      # The judge receives a sandbox-local policy snapshot at /app. Trace both
+      # expected reads and suspicious writes there, plus any direct EFS access.
+      verifier_file_access_audit:
+        trace_subdir: judge
+        trace_filename: .judge-fs.trace
+        audited_paths:
+          policy_artifacts: /app
+          efs: ${oc.env:HARBOR_EFS_ARTIFACT_MOUNT_PATH,/mnt/nemo-gym-harbor-artifacts}
+
       # Harbor collects this after the policy exits and rehydrates it at the
-      # same path in the separate verifier sandbox. Set
-      # HARBOR_POLICY_WORKSPACE_EXCLUDES='[data]' only when /app/data is
-      # independently mounted into both sandboxes.
+      # same path in the separate verifier sandbox. OpenCode's harness-owned
+      # local state is never part of the submission. Add data to the override
+      # only when /app/data is independently mounted into both sandboxes.
       artifacts:
         - source: /app
-          exclude: ${oc.create:${oc.env:HARBOR_POLICY_WORKSPACE_EXCLUDES,[]}}
+          exclude: ${oc.create:${oc.env:HARBOR_POLICY_WORKSPACE_EXCLUDES,[.opencode]}}

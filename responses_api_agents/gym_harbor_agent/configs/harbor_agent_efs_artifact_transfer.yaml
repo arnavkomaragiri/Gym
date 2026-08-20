@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Layer this after harbor_agent_opensandbox.yaml. The launcher mounts one
+# project-scoped EFS volume into both policy and verifier sandboxes; this root
+# is a relay namespace inside that mount, not the blanket /mnt/efs-data mount.
+gym_harbor_agent:
+  responses_api_agents:
+    gym_harbor_agent:
+      environment:
+        kwargs:
+          shared_artifact_transfer:
+            root: ${oc.env:HARBOR_EFS_ARTIFACT_ROOT,/mnt/nemo-gym-harbor-artifacts/relay}
+            sources: ${oc.create:${oc.env:HARBOR_EFS_ARTIFACT_SOURCES,[/app]}}
+            timeout_s: ${oc.decode:${oc.env:HARBOR_EFS_ARTIFACT_TIMEOUT_S,600}}
+            stale_after_s: ${oc.decode:${oc.env:HARBOR_EFS_ARTIFACT_STALE_AFTER_S,86400}}

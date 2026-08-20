@@ -16,12 +16,14 @@ from harbor.models.trial.paths import TrialPaths
 from responses_api_agents.gym_harbor_agent.agentic_verifier import (
     AgenticVerifier,
     AgenticVerifierConfig,
+    _validate_score_trajectory,
 )
 
 
 class FakeJudge:
-    def __init__(self, reward_path: Path, config) -> None:
+    def __init__(self, reward_path: Path, logs_dir: Path, config) -> None:
         self.reward_path = reward_path
+        self.logs_dir = logs_dir
         self.config = config
         self.extra_env = dict(config.env)
         self.session_id = None
@@ -35,6 +37,32 @@ class FakeJudge:
         self.instructions.append(instruction)
         await environment.exec("judge-run")
         self.reward_path.write_text(json.dumps({"reward": 0.75}))
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        (self.logs_dir / "trajectory.json").write_text(
+            json.dumps(
+                {
+                    "steps": [
+                        {
+                            "tool_calls": [
+                                {
+                                    "tool_call_id": "score-1",
+                                    "function_name": "harbor_score_score_solution",
+                                }
+                            ],
+                            "observation": {
+                                "results": [
+                                    {
+                                        "source_call_id": "score-1",
+                                        "content": '{"accepted": true}',
+                                    }
+                                ]
+                            },
+                        },
+                        {"message": "done", "tool_calls": None},
+                    ]
+                }
+            )
+        )
 
     def populate_context_post_run(self, context: AgentContext) -> None:
         context.metadata = {"judge": "complete"}
@@ -154,8 +182,43 @@ def test_configures_opencode_judge_api_transport(
     }
 
 
+def test_configures_preinstalled_opencode_judge_api_transport(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("TEST_JUDGE_KEY", "secret-key")
+    monkeypatch.setenv("TEST_JUDGE_BASE", "https://judge.test/v1")
+    config = make_config()
+    config["judge_agent"] = {
+        "name": None,
+        "import_path": ("responses_api_agents.gym_harbor_agent.audited_opencode:PreinstalledOpenCode"),
+        "model_name": "org/judge-model",
+    }
+    config["judge_opencode_provider"] = {
+        "api_mode": "chat_completions",
+        "base_url": "https://judge.test/v1",
+    }
+    trial_paths = TrialPaths(tmp_path / "trial")
+    trial_paths.mkdir()
+    verifier = AgenticVerifier(
+        task=make_task(tmp_path),
+        trial_paths=trial_paths,
+        environment=make_environment(),
+        config=config,
+    )
+
+    judge = verifier._resolved_judge_agent()
+
+    assert judge.name is None
+    assert judge.import_path.endswith(":PreinstalledOpenCode")
+    assert judge.model_name == "rubric/org/judge-model"
+
+
 @pytest.mark.asyncio
-async def test_runs_judge_through_harbor_agent_factory(monkeypatch, tmp_path: Path) -> None:
+async def test_runs_judge_through_harbor_agent_factory(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
     monkeypatch.setenv("TEST_JUDGE_KEY", "secret-key")
     monkeypatch.setenv("TEST_JUDGE_BASE", "https://judge.test/v1")
     trial_paths = TrialPaths(tmp_path / "trial")
@@ -166,7 +229,7 @@ async def test_runs_judge_through_harbor_agent_factory(monkeypatch, tmp_path: Pa
     def create_agent(config, **_kwargs):
         created["config"] = config
         created["kwargs"] = _kwargs
-        created["judge"] = FakeJudge(trial_paths.reward_json_path, config)
+        created["judge"] = FakeJudge(trial_paths.reward_json_path, _kwargs["logs_dir"], config)
         return created["judge"]
 
     monkeypatch.setattr(
@@ -198,6 +261,59 @@ async def test_runs_judge_through_harbor_agent_factory(monkeypatch, tmp_path: Pa
     assert json.loads((trial_paths.verifier_dir / "judge" / "context.json").read_text())["metadata"] == {
         "judge": "complete"
     }
+    assert json.loads((trial_paths.verifier_dir / "score_integrity.json").read_text()) == {
+        "accepted_call_count": 1,
+        "reason": "",
+        "terminal": True,
+    }
+
+
+def test_score_integrity_allows_failed_attempt_before_terminal_accepted_call(tmp_path: Path) -> None:
+    trajectory_path = tmp_path / "trajectory.json"
+    trajectory_path.write_text(
+        json.dumps(
+            {
+                "steps": [
+                    {
+                        "tool_calls": [{"tool_call_id": "failed", "function_name": "harbor_score_score_solution"}],
+                        "observation": None,
+                    },
+                    {
+                        "tool_calls": [{"tool_call_id": "accepted", "function_name": "harbor_score_score_solution"}],
+                        "observation": {"results": [{"source_call_id": "accepted", "content": '{"accepted": true}'}]},
+                    },
+                    {"message": "done", "tool_calls": None},
+                ]
+            }
+        )
+    )
+
+    result = _validate_score_trajectory(trajectory_path)
+
+    assert result.terminal is True
+    assert result.accepted_call_count == 1
+
+
+def test_score_integrity_rejects_tool_call_after_accepted_score(tmp_path: Path) -> None:
+    trajectory_path = tmp_path / "trajectory.json"
+    trajectory_path.write_text(
+        json.dumps(
+            {
+                "steps": [
+                    {
+                        "tool_calls": [{"tool_call_id": "accepted", "function_name": "score_solution"}],
+                        "observation": {"results": [{"source_call_id": "accepted", "content": '{"accepted": true}'}]},
+                    },
+                    {"tool_calls": [{"tool_call_id": "later", "function_name": "bash"}]},
+                ]
+            }
+        )
+    )
+
+    result = _validate_score_trajectory(trajectory_path)
+
+    assert result.terminal is False
+    assert result.reason == "accepted score_solution call was not the judge's final tool call"
 
 
 @pytest.mark.asyncio

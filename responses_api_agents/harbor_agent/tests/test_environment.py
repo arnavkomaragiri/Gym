@@ -12,9 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import io
+import json
+import re
 import tarfile
 from pathlib import Path
 from typing import Optional
+from unittest.mock import AsyncMock
+from uuid import uuid4
 
 import pytest
 from harbor.models.task.config import EnvironmentConfig as TaskEnvironmentConfig
@@ -150,6 +154,20 @@ class TestValidation:
         )
         assert env.can_disable_internet is True
 
+    def test_rejects_unsafe_sandbox_path_copy(self, tmp_path):
+        with pytest.raises(ValueError, match="absolute non-root path"):
+            _make_environment(
+                tmp_path,
+                sandbox_path_copies=[{"source": "../dataset", "destination": "/app/data"}],
+            )
+
+    def test_rejects_shared_artifact_root_inside_source(self, tmp_path):
+        with pytest.raises(ValueError, match="must not overlap"):
+            _make_environment(
+                tmp_path,
+                shared_artifact_transfer={"root": "/app/.relay", "sources": ["/app"]},
+            )
+
 
 class TestStartStop:
     @pytest.mark.asyncio
@@ -209,6 +227,54 @@ class TestStartStop:
             ],
             "extensions": {"trial": "example-task__trial-1", "task": "example-task"},
         }
+
+    @pytest.mark.asyncio
+    async def test_start_copies_mounted_task_data_before_environment_upload(self, tmp_path):
+        environment_dir = tmp_path / "task" / "environment"
+        (environment_dir / "data").mkdir(parents=True)
+        (environment_dir / "data" / "local.txt").write_text("do not upload")
+        (environment_dir / "instruction.txt").write_text("analyze /app/data")
+        env = _make_environment(
+            tmp_path,
+            environment_dir=environment_dir,
+            task_env_config=TaskEnvironmentConfig(
+                docker_image="docker.io/example/task:1.0",
+                workdir="/app",
+            ),
+            sandbox_path_copies=[
+                {
+                    "source": "/mounted/tasks/{environment_name}/environment/data",
+                    "destination": "/app/data",
+                }
+            ],
+            sandbox_path_copy_timeout_s=321,
+            environment_upload_excludes=["data"],
+        )
+
+        await env.start(force_build=False)
+
+        provider = _provider()
+        assert provider.created_specs[0].env == {}
+        copy_call = provider.exec_calls[1]
+        assert copy_call == {
+            "command": (
+                "test -d /mounted/tasks/example-task/environment/data && mkdir -p /app/data "
+                "&& cp -a -- /mounted/tasks/example-task/environment/data/. /app/data/"
+            ),
+            "cwd": "/",
+            "env": None,
+            "timeout_s": 321,
+            "user": None,
+        }
+        upload_call_index = next(
+            index for index, call in enumerate(provider.exec_calls) if "tar -xzf" in call["command"]
+        )
+        assert upload_call_index > 1
+        archive = next(iter(provider.uploads.values()))
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
+            names = {member.name for member in tar.getmembers()}
+        assert "./instruction.txt" in names
+        assert not any(name == "./data" or name.startswith("./data/") for name in names)
 
     @pytest.mark.asyncio
     async def test_start_honours_harbor_resource_overrides(self, tmp_path):
@@ -336,6 +402,256 @@ class TestStartStop:
         upload_commands = [call["command"] for call in provider.exec_calls]
         assert any("tar -xzf" in command and "-C /tests" in command for command in upload_commands)
         assert any("tar -xzf" in command and "-C /app" in command for command in upload_commands)
+
+    @pytest.mark.asyncio
+    async def test_separate_verifier_restores_sandbox_copy_after_workspace_reset(self, tmp_path):
+        tests_dir = tmp_path / "task" / "steps" / "rollout" / "tests"
+        tests_dir.mkdir(parents=True)
+        env = _make_environment(
+            tmp_path,
+            environment_dir=tests_dir,
+            session_id="example-task__trial-1__verifier__rollout",
+            task_env_config=TaskEnvironmentConfig(
+                docker_image="docker.io/example/task:1.0",
+                workdir="/app",
+            ),
+            sandbox_path_copies=[
+                {
+                    "source": "/mounted/tasks/{environment_name}/environment/data",
+                    "destination": "/app/data",
+                }
+            ],
+        )
+        await env.start(force_build=False)
+        provider = _provider()
+        provider.exec_calls.clear()
+
+        await env.empty_dirs(["/app"], chmod=True)
+
+        assert len(provider.exec_calls) == 2
+        assert provider.exec_calls[0]["cwd"] == "/"
+        assert "find /app -mindepth 1" in provider.exec_calls[0]["command"]
+        assert provider.exec_calls[1] == {
+            "command": (
+                "test -d /mounted/tasks/example-task/environment/data && mkdir -p /app/data "
+                "&& cp -a -- /mounted/tasks/example-task/environment/data/. /app/data/"
+            ),
+            "cwd": "/",
+            "env": None,
+            "timeout_s": 1200,
+            "user": None,
+        }
+
+    @pytest.mark.asyncio
+    async def test_workspace_reset_preserves_nested_sandbox_volume(self, tmp_path):
+        env = _make_environment(
+            tmp_path,
+            session_id="example-task__trial-1__verifier__rollout",
+            sandbox_provider_options={
+                "volumes": [
+                    {
+                        "name": "problem-data",
+                        "mountPath": "/app/data",
+                        "readOnly": True,
+                    }
+                ]
+            },
+        )
+        await env.start(force_build=False)
+        provider = _provider()
+        provider.exec_calls.clear()
+
+        await env.empty_dirs(["/app"], chmod=True)
+
+        command = provider.exec_calls[0]["command"]
+        assert "! -path /app/data" in command
+        assert "find /app -mindepth 1 -maxdepth 1" in command
+
+
+class TestSharedArtifactTransfer:
+    @staticmethod
+    def _config() -> dict:
+        return {
+            "root": "/mnt/efs-data/.nemo-gym-harbor-artifacts",
+            "sources": ["/app"],
+            "timeout_s": 60,
+        }
+
+    @pytest.mark.asyncio
+    async def test_relays_workspace_only_after_confirmed_policy_stop(self, tmp_path):
+        context_id = uuid4()
+        source_env = _make_environment(
+            tmp_path,
+            shared_artifact_transfer=self._config(),
+        )
+        source_env.context_id = context_id
+        await source_env.start(force_build=False)
+        source_provider = _provider()
+        source_provider.queue_exec_result(SandboxExecResult(stdout=f"{'a' * 64}\n", stderr=None, return_code=0))
+
+        artifact_dir = tmp_path / "artifacts" / "app"
+        await source_env.download_dir_with_exclusions(
+            source_dir="/app",
+            target_dir=artifact_dir,
+            exclude=["data"],
+        )
+        marker_path = artifact_dir / ".nemo-gym-shared-artifact.json"
+        before_stop = json.loads(marker_path.read_text())
+        assert before_stop["source_environment_stopped"] is False
+        assert before_stop["consumed"] is False
+        snapshot_command = source_provider.exec_calls[-1]["command"]
+        assert "--exclude=data" in snapshot_command
+        assert str(context_id) in snapshot_command
+
+        await source_env.stop(delete=True)
+        after_stop = json.loads(marker_path.read_text())
+        assert after_stop["source_environment_stopped"] is True
+
+        FakeProvider.instances.clear()
+        tests_dir = tmp_path / "task" / "steps" / "rollout" / "tests"
+        tests_dir.mkdir(parents=True)
+        (tests_dir / "test.sh").write_text("true\n")
+        verifier_env = _make_environment(
+            tmp_path,
+            environment_dir=tests_dir,
+            session_id="example-task__trial-1__verifier__rollout",
+            shared_artifact_transfer=self._config(),
+        )
+        verifier_env.context_id = context_id
+        await verifier_env.start(force_build=False)
+        verifier_provider = _provider()
+        verifier_provider.exec_calls.clear()
+
+        await verifier_env.upload_dir(artifact_dir, "/app")
+
+        restore_command = verifier_provider.exec_calls[0]["command"]
+        assert "cp -a --" in restore_command
+        assert "workspace.tar" in restore_command
+        assert "sha256sum" in restore_command
+        assert f"rm -rf -- /mnt/efs-data/.nemo-gym-harbor-artifacts/v1/{context_id}" not in restore_command
+        assert json.loads(marker_path.read_text())["consumed"] is True
+
+        await verifier_env.stop(delete=True)
+
+        cleanup_command = verifier_provider.exec_calls[-1]["command"]
+        assert f"rm -rf -- /mnt/efs-data/.nemo-gym-harbor-artifacts/v1/{context_id}" in cleanup_command
+        assert verifier_provider.closed_handles == ["sbx-123"]
+
+    @pytest.mark.asyncio
+    async def test_verifier_cleanup_failure_still_terminates_sandbox(self, tmp_path):
+        context_id = uuid4()
+        artifact_dir = tmp_path / "artifacts" / "app"
+        artifact_dir.mkdir(parents=True)
+        marker_path = artifact_dir / ".nemo-gym-shared-artifact.json"
+        marker_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "context_id": str(context_id),
+                    "source": "/app",
+                    "remote_path": (f"/mnt/efs-data/.nemo-gym-harbor-artifacts/v1/{context_id}/transfer"),
+                    "sha256": "a" * 64,
+                    "source_environment_stopped": True,
+                    "consumed": False,
+                }
+            )
+        )
+        tests_dir = tmp_path / "task" / "steps" / "rollout" / "tests"
+        tests_dir.mkdir(parents=True)
+        verifier_env = _make_environment(
+            tmp_path,
+            environment_dir=tests_dir,
+            session_id="example-task__trial-1__verifier__rollout",
+            shared_artifact_transfer=self._config(),
+        )
+        verifier_env.context_id = context_id
+        await verifier_env.start(force_build=False)
+        provider = _provider()
+        provider.exec_calls.clear()
+        await verifier_env.upload_dir(artifact_dir, "/app")
+        provider.queue_exec_result(SandboxExecResult(stdout="", stderr="EFS unavailable", return_code=1))
+
+        with pytest.raises(RuntimeError, match="EFS unavailable"):
+            await verifier_env.stop(delete=True)
+
+        assert provider.closed_handles == ["sbx-123"]
+
+    @pytest.mark.asyncio
+    async def test_rejects_shared_workspace_before_policy_stop(self, tmp_path):
+        env = _make_environment(
+            tmp_path,
+            shared_artifact_transfer=self._config(),
+        )
+        await env.start(force_build=False)
+        _provider().queue_exec_result(SandboxExecResult(stdout=f"{'a' * 64}\n", stderr=None, return_code=0))
+        artifact_dir = tmp_path / "artifacts" / "app"
+        await env.download_dir(source_dir="/app", target_dir=artifact_dir)
+
+        with pytest.raises(RuntimeError, match="before source sandbox teardown"):
+            await env.upload_dir(artifact_dir, "/app")
+
+    @pytest.mark.asyncio
+    async def test_snapshot_failure_reports_sandbox_stdout_and_stderr(self, tmp_path):
+        env = _make_environment(
+            tmp_path,
+            shared_artifact_transfer=self._config(),
+        )
+        await env.start(force_build=False)
+        _provider().queue_exec_result(
+            SandboxExecResult(
+                stdout="unsupported artifact entry: ./linked-file\n",
+                stderr="exit status 73",
+                return_code=73,
+            )
+        )
+
+        with pytest.raises(RuntimeError) as error:
+            await env.download_dir_with_exclusions(
+                source_dir="/app",
+                target_dir=tmp_path / "artifacts" / "app",
+                exclude=["data", ".opencode"],
+            )
+
+        assert "unsupported artifact entry: ./linked-file" in str(error.value)
+        assert "exit status 73" in str(error.value)
+
+    @pytest.mark.asyncio
+    async def test_failed_policy_stop_does_not_authorize_shared_handoff(self, tmp_path):
+        env = _make_environment(
+            tmp_path,
+            shared_artifact_transfer=self._config(),
+        )
+        await env.start(force_build=False)
+        _provider().queue_exec_result(SandboxExecResult(stdout=f"{'a' * 64}\n", stderr=None, return_code=0))
+        artifact_dir = tmp_path / "artifacts" / "app"
+        await env.download_dir(source_dir="/app", target_dir=artifact_dir)
+        marker_path = artifact_dir / ".nemo-gym-shared-artifact.json"
+        provider = _provider()
+        provider.close = AsyncMock(side_effect=TimeoutError("kill timed out"))
+
+        with pytest.raises(TimeoutError, match="kill timed out"):
+            await env.stop(delete=True)
+
+        assert json.loads(marker_path.read_text())["source_environment_stopped"] is False
+
+    @pytest.mark.asyncio
+    async def test_policy_workspace_reset_does_not_restore_sandbox_copy(self, tmp_path):
+        env = _make_environment(
+            tmp_path,
+            task_env_config=TaskEnvironmentConfig(
+                docker_image="docker.io/example/task:1.0",
+                workdir="/app",
+            ),
+            sandbox_path_copies=[{"source": "/mounted/data", "destination": "/app/data"}],
+        )
+        await env.start(force_build=False)
+        provider = _provider()
+        provider.exec_calls.clear()
+
+        await env.empty_dirs(["/app"], chmod=True)
+
+        assert len(provider.exec_calls) == 1
+        assert provider.exec_calls[0]["cwd"] == "/"
 
     @pytest.mark.asyncio
     async def test_start_can_exclude_volume_backed_environment_data(self, tmp_path):
@@ -596,8 +912,9 @@ class TestFileTransfer:
 
         async def _exec_and_stash(handle, command, **kwargs):
             provider.exec_calls.append({"command": command, **kwargs})
-            if command.startswith("tar -czf"):
-                remote_tar = command.split()[2]
+            match = re.search(r"tar -czf (\S+)", command)
+            if match is not None:
+                remote_tar = match.group(1)
                 provider.downloads[remote_tar] = payload.getvalue()
             return SandboxExecResult(stdout="", stderr=None, return_code=0)
 
@@ -606,6 +923,76 @@ class TestFileTransfer:
         target = tmp_path / "verifier-out"
         await env.download_dir("/logs/verifier", target)
         assert (target / "reward.txt").read_bytes() == b"reward"
+        archive_call = next(call for call in provider.exec_calls if "tar -czf" in call["command"])
+        assert archive_call["cwd"] == "/"
+        assert "cp -a -- /logs/verifier/." in archive_call["command"]
+
+    @pytest.mark.asyncio
+    async def test_download_dir_with_exclusions_does_not_snapshot_excluded_data(self, tmp_path):
+        env = _make_environment(
+            tmp_path,
+            task_env_config=TaskEnvironmentConfig(
+                docker_image="docker.io/example/task:1.0",
+                workdir="/app",
+            ),
+        )
+        await env.start(force_build=False)
+        provider = _provider()
+
+        payload = io.BytesIO()
+        with tarfile.open(fileobj=payload, mode="w:gz") as tar:
+            content = b"report"
+            info = tarfile.TarInfo("./REPORT.md")
+            info.size = len(content)
+            tar.addfile(info, io.BytesIO(content))
+
+        async def _exec_and_stash(handle, command, **kwargs):
+            provider.exec_calls.append({"command": command, **kwargs})
+            match = re.search(r"tar -czf (\S+)", command)
+            if match is not None:
+                provider.downloads[match.group(1)] = payload.getvalue()
+            return SandboxExecResult(stdout="", stderr=None, return_code=0)
+
+        provider.exec = _exec_and_stash
+        target = tmp_path / "policy-workspace"
+
+        await env.download_dir_with_exclusions(
+            source_dir="/app",
+            target_dir=target,
+            exclude=["data"],
+        )
+
+        assert (target / "REPORT.md").read_bytes() == b"report"
+        archive_call = next(call for call in provider.exec_calls if "tar -czf" in call["command"])
+        assert archive_call["cwd"] == "/"
+        assert "--exclude=data" in archive_call["command"]
+        assert "cp -a" not in archive_call["command"]
+
+    @pytest.mark.asyncio
+    async def test_download_dir_with_exclusions_fallback_skips_excluded_data(self, tmp_path):
+        env = _make_environment(tmp_path)
+        await env.start(force_build=False)
+        provider = _provider()
+        provider.downloads["/app/REPORT.md"] = b"report"
+        provider.queue_exec_result(SandboxExecResult(stdout=None, stderr="tar failed", return_code=1))
+        provider.queue_exec_result(SandboxExecResult(stdout="", stderr=None, return_code=0))
+        provider.queue_exec_result(
+            SandboxExecResult(
+                stdout="/app/REPORT.md\n/app/data/input.csv\n",
+                stderr=None,
+                return_code=0,
+            )
+        )
+
+        target = tmp_path / "policy-workspace"
+        await env.download_dir_with_exclusions(
+            source_dir="/app",
+            target_dir=target,
+            exclude=["data"],
+        )
+
+        assert (target / "REPORT.md").read_bytes() == b"report"
+        assert not (target / "data").exists()
 
     @pytest.mark.asyncio
     async def test_download_dir_falls_back_to_per_file(self, tmp_path):

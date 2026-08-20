@@ -21,6 +21,12 @@ sandbox:
       deadline_s: ${oc.decode:${oc.env:HARBOR_SANDBOX_PROBE_DEADLINE_S,null}}
       stable_count: ${oc.decode:${oc.env:HARBOR_SANDBOX_PROBE_STABLE_COUNT,1}}
       stable_delay_s: ${oc.decode:${oc.env:HARBOR_SANDBOX_PROBE_STABLE_DELAY_S,0.0}}
+    # Long OpenCode runs are submitted once and polled through short status
+    # requests. This avoids holding an HTTP chunked-response stream open for
+    # the full policy or judge timeout.
+    operations:
+      background_exec: true
+      background_poll_interval_s: 10.0
 
 gym_harbor_agent:
   responses_api_agents:
@@ -52,8 +58,21 @@ gym_harbor_agent:
             volumes: ${oc.create:${oc.env:HARBOR_SANDBOX_VOLUMES,[]}}
           # Relative task environment paths supplied by the image or a volume.
           environment_upload_excludes: ${oc.create:${oc.env:HARBOR_ENVIRONMENT_UPLOAD_EXCLUDES,[]}}
+          # Optional compatibility path for writable copies. Prefer mounting a
+          # task-specific read-only S3 volume directly at /app/data.
+          sandbox_path_copies: ${oc.create:${oc.env:HARBOR_SANDBOX_PATH_COPIES,[]}}
           sandbox_metadata:
             harbor-benchmark: ${oc.env:HARBOR_BENCHMARK_NAME,harbor}
+            # EFS is mounted as a scoped provider volume. Never expose the
+            # blanket mount merely to relay policy artifacts.
+            nemo.nvidia.com/efs-hostpath: 'false'
+            # The clean path uses only task-specific read-only S3 volumes.
+            nemo.nvidia.com/s3-hostpath: ${oc.env:HARBOR_ENABLE_DEFAULT_S3_MOUNT,'false'}
           sandbox_ttl_s: 7200
           sandbox_ready_timeout_s: 1200
           default_exec_timeout_s: 3600
+          # OpenSandbox background logs combine stdout and stderr. An
+          # interactive shell emits job-control warnings without a TTY, which
+          # corrupts stdout-only probes such as Harbor's `pwd` workdir lookup.
+          # OpenCode sources NVM explicitly in its install and run commands.
+          exec_shell: bash -lc

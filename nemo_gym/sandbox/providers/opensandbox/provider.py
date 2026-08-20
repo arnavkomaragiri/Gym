@@ -19,6 +19,8 @@ import logging
 import re
 import shlex
 import ssl
+import time
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
@@ -51,6 +53,10 @@ class OpenSandboxCreateTimeoutError(OpenSandboxCreateError):
 
 class OpenSandboxCreateVerificationError(SandboxCreateVerificationError):
     """Raised when a newly-created sandbox cannot execute a probe command."""
+
+
+class OpenSandboxLifecycleResetError(RuntimeError):
+    """Raised when a live sandbox loses its provider-side command state."""
 
 
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
@@ -102,6 +108,7 @@ IMAGE_PULL_POLICY_ANNOTATION_EXTENSION_KEY = "opensandbox.extensions.image-pull-
 VALID_IMAGE_PULL_POLICIES = {"Always", "IfNotPresent", "Never"}
 STATUS_CODE_RE = re.compile(r"(?:status code|http)\D+(\d{3})", re.IGNORECASE)
 SERVER_PROXY_API_KEY_HEADER = "OPEN-SANDBOX-API-KEY"
+LIFECYCLE_FINGERPRINT_PATH = "/tmp/.nemo-gym-sandbox-instance"
 
 
 def validate_image_pull_policy(image_pull_policy: str) -> str:
@@ -596,6 +603,7 @@ class OpenSandboxProvider:
         # create, so the provider owns this one: built once, reused by every
         # ConnectionConfig, closed in aclose().
         self._transport: Any | None = None
+        self._lifecycle_fingerprints: dict[str, str] = {}
 
     def _resolve_extensions(self, extensions: Mapping[str, str]) -> dict[str, str]:
         """Add the configured default image pull policy to SDK create extensions."""
@@ -720,7 +728,112 @@ class OpenSandboxProvider:
             ),
             timeout=timeout_s,
         )
-        return SandboxHandle(sandbox_id=str(sandbox.id), provider_name=self.name, raw=sandbox)
+        handle = SandboxHandle(sandbox_id=str(sandbox.id), provider_name=self.name, raw=sandbox)
+        await self._remember_existing_lifecycle_fingerprint(handle)
+        return handle
+
+    async def _remember_existing_lifecycle_fingerprint(self, handle: SandboxHandle) -> None:
+        """Record an existing marker when reconnecting without changing its identity."""
+        try:
+            marker = (await self._read_lifecycle_fingerprint(handle)).decode().strip()
+        except Exception as error:  # noqa: BLE001 - absence is useful only during failure diagnosis
+            LOGGER.warning(
+                "Could not read OpenSandbox lifecycle fingerprint while reconnecting; sandbox_id=%s; error=%r",
+                handle.sandbox_id,
+                error,
+            )
+            return
+        if marker:
+            self._lifecycle_fingerprints[handle.sandbox_id] = marker
+            LOGGER.info(
+                "Recorded existing OpenSandbox lifecycle fingerprint; sandbox_id=%s; fingerprint=%s",
+                handle.sandbox_id,
+                marker,
+            )
+
+    async def _read_lifecycle_fingerprint(self, handle: SandboxHandle) -> bytes:
+        """Read the marker with a short diagnostic deadline and no retry loop."""
+        return await self._await_sdk_operation(
+            lambda: handle.raw.files.read_bytes(LIFECYCLE_FINGERPRINT_PATH),
+            operation="read lifecycle fingerprint",
+            sandbox_id=handle.sandbox_id,
+            timeout_s=30.0,
+            retries=0,
+        )
+
+    async def _initialize_lifecycle_fingerprint(self, handle: SandboxHandle) -> None:
+        """Persist a provider-generated identity inside the sandbox filesystem."""
+        marker = uuid.uuid4().hex
+        await self._write_file(handle, LIFECYCLE_FINGERPRINT_PATH, f"{marker}\n")
+        self._lifecycle_fingerprints[handle.sandbox_id] = marker
+        LOGGER.info(
+            "Initialized OpenSandbox lifecycle fingerprint; sandbox_id=%s; fingerprint=%s",
+            handle.sandbox_id,
+            marker,
+        )
+
+    @staticmethod
+    def _is_missing_background_command_error(error: BaseException) -> bool:
+        message = str(error).lower()
+        return "command not found" in message
+
+    async def _collect_lifecycle_diagnostics(self, handle: SandboxHandle) -> str:
+        """Collect bounded evidence after execd loses a background command."""
+        diagnostics: list[str] = []
+        expected = self._lifecycle_fingerprints.get(handle.sandbox_id)
+        diagnostics.append(f"expected_fingerprint={expected or '<unrecorded>'}")
+
+        get_info = getattr(handle.raw, "get_info", None)
+        if get_info is not None:
+            try:
+                info = await self._await_sdk_operation(
+                    get_info,
+                    operation="lifecycle diagnostic get_info",
+                    sandbox_id=handle.sandbox_id,
+                    timeout_s=30.0,
+                    retries=0,
+                )
+                raw_status = getattr(info, "status", None)
+                diagnostics.append(
+                    "control_plane_state="
+                    + str(getattr(raw_status, "state", None) if raw_status is not None else None)
+                )
+            except Exception as error:  # noqa: BLE001 - preserve the original failure
+                diagnostics.append(f"get_info_error={type(error).__name__}: {error}")
+
+        try:
+            observed = (await self._read_lifecycle_fingerprint(handle)).decode().strip()
+            diagnostics.append(f"observed_fingerprint={observed or '<empty>'}")
+            diagnostics.append(f"fingerprint_matches={observed == expected if expected is not None else 'unknown'}")
+        except Exception as error:  # noqa: BLE001 - a missing marker supports the diagnosis
+            diagnostics.append(f"fingerprint_read_error={type(error).__name__}: {error}")
+
+        try:
+            _, _, RunCommandOpts, _, _ = _require_opensandbox_sdk()
+            command = (
+                "printf 'hostname='; hostname 2>/dev/null || true; "
+                "printf 'boot_id='; cat /proc/sys/kernel/random/boot_id 2>/dev/null || true; "
+                "printf 'pid1_start='; cut -d' ' -f22 /proc/1/stat 2>/dev/null || true; "
+                "printf 'app_dir='; test -d /app && echo present || echo missing; "
+                "printf 'memory_events='; tr '\\n' ',' </sys/fs/cgroup/memory.events 2>/dev/null || true"
+            )
+            execution = await self._await_sdk_operation(
+                lambda: handle.raw.commands.run(
+                    command,
+                    opts=RunCommandOpts(timeout=timedelta(seconds=20)),
+                ),
+                operation="lifecycle diagnostic command",
+                sandbox_id=handle.sandbox_id,
+                timeout_s=30.0,
+                retries=0,
+            )
+            output = "\n".join(message.text for message in execution.logs.stdout).strip()
+            diagnostics.append(f"fresh_exec={output[:1000] or '<no output>'}")
+            if execution.error is not None:
+                diagnostics.append(f"fresh_exec_error={execution.error.name}: {execution.error.value}")
+        except Exception as error:  # noqa: BLE001 - preserve the original failure
+            diagnostics.append(f"fresh_exec_error={type(error).__name__}: {error}")
+        return "; ".join(diagnostics)
 
     async def _await_sdk_call(
         self,
@@ -969,6 +1082,7 @@ class OpenSandboxProvider:
             if self._create.skip_health_check:
                 handle = await self._connect_after_create(created_handle, spec)
             await self._verify_created_handle(handle)
+            await self._initialize_lifecycle_fingerprint(handle)
         except Exception:
             await self._cleanup_failed_create_handle(created_handle)
             raise
@@ -1163,14 +1277,29 @@ class OpenSandboxProvider:
         # Poll fast at first so the many short commands an agent issues are
         # detected promptly, then back off so long ones do not spam requests.
         poll_interval = min(self._operations.background_poll_initial_s, self._operations.background_poll_interval_s)
+        polling_started_at = time.monotonic()
         while True:
-            status = await self._await_sdk_operation(
-                lambda: handle.raw.commands.get_command_status(execution_id),
-                operation="command status",
-                sandbox_id=handle.sandbox_id,
-                timeout_s=poll_timeout_s,
-                retries=self._operations.retries,
-            )
+            try:
+                status = await self._await_sdk_operation(
+                    lambda: handle.raw.commands.get_command_status(execution_id),
+                    operation="command status",
+                    sandbox_id=handle.sandbox_id,
+                    timeout_s=poll_timeout_s,
+                    retries=self._operations.retries,
+                )
+            except Exception as error:
+                if not self._is_missing_background_command_error(error):
+                    raise
+                diagnostics = await self._collect_lifecycle_diagnostics(handle)
+                elapsed_s = time.monotonic() - polling_started_at
+                message = (
+                    "OpenSandbox background command state disappeared; treating the sandbox as "
+                    "restarted or rebound instead of replaying the command in place. "
+                    f"sandbox_id={handle.sandbox_id!r}, execution_id={execution_id!r}, "
+                    f"poll_elapsed_s={elapsed_s:.1f}; {diagnostics}"
+                )
+                LOGGER.error(message)
+                raise OpenSandboxLifecycleResetError(message) from error
             # A renamed SDK field must not degrade silently: a missing `running`
             # would end the poll at once, a missing `exit_code` would score a
             # failed command as a success.
@@ -1190,13 +1319,27 @@ class OpenSandboxProvider:
         # The execution has finished, so one call returns its whole buffer; the
         # cursor this endpoint reports back is the end offset rather than a
         # more-data flag, so there is no tail to follow.
-        logs = await self._await_sdk_operation(
-            lambda: handle.raw.commands.get_background_command_logs(execution_id),
-            operation="command logs",
-            sandbox_id=handle.sandbox_id,
-            timeout_s=poll_timeout_s,
-            retries=self._operations.retries,
-        )
+        try:
+            logs = await self._await_sdk_operation(
+                lambda: handle.raw.commands.get_background_command_logs(execution_id),
+                operation="command logs",
+                sandbox_id=handle.sandbox_id,
+                timeout_s=poll_timeout_s,
+                retries=self._operations.retries,
+            )
+        except Exception as error:
+            if not self._is_missing_background_command_error(error):
+                raise
+            diagnostics = await self._collect_lifecycle_diagnostics(handle)
+            elapsed_s = time.monotonic() - polling_started_at
+            message = (
+                "OpenSandbox background command logs disappeared; treating the sandbox as "
+                "restarted or rebound instead of replaying the command in place. "
+                f"sandbox_id={handle.sandbox_id!r}, execution_id={execution_id!r}, "
+                f"poll_elapsed_s={elapsed_s:.1f}; {diagnostics}"
+            )
+            LOGGER.error(message)
+            raise OpenSandboxLifecycleResetError(message) from error
         stdout = getattr(logs, "content", None) or None
         status_error = getattr(status, "error", None)
         stderr = status_error or None
@@ -1265,6 +1408,7 @@ class OpenSandboxProvider:
 
     async def close(self, handle: SandboxHandle) -> None:
         """Terminate the sandbox and close local SDK resources."""
+        self._lifecycle_fingerprints.pop(handle.sandbox_id, None)
         stop_error: Exception | None = None
         try:
             await self._await_sdk_operation(

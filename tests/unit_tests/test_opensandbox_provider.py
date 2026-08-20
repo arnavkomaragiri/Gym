@@ -21,6 +21,7 @@ from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -55,6 +56,17 @@ class FakeVolume:
     name: str
 
 
+class FakeSandboxFiles:
+    def __init__(self) -> None:
+        self.contents: dict[str, bytes] = {}
+
+    async def write_file(self, target_path: str, data: str | bytes) -> None:
+        self.contents[target_path] = data.encode() if isinstance(data, str) else data
+
+    async def read_bytes(self, source_path: str) -> bytes:
+        return self.contents[source_path]
+
+
 class FakeSandbox:
     created_kwargs: dict[str, Any] = {}
     connected_args: tuple[Any, ...] = ()
@@ -62,6 +74,7 @@ class FakeSandbox:
 
     def __init__(self, sandbox_id: str = "sandbox-1") -> None:
         self.id = sandbox_id
+        self.files = FakeSandboxFiles()
 
     @classmethod
     async def create(cls, *_args: Any, **kwargs: Any) -> "FakeSandbox":
@@ -662,6 +675,49 @@ async def test_exec_background_polls_status_and_logs(monkeypatch: pytest.MonkeyP
     assert raw.commands.run_calls[0][1].kwargs["background"] is True
     assert raw.commands.status_calls == ["exec-42", "exec-42"]
     assert raw.commands.log_calls == ["exec-42"]
+
+
+@pytest.mark.asyncio
+async def test_exec_background_classifies_missing_command_as_lifecycle_reset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeRunCommandOpts:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+
+    class FakeCommands:
+        async def run(self, command: str, *, opts: FakeRunCommandOpts) -> Any:
+            return SimpleNamespace(id="exec-lost")
+
+        async def get_command_status(self, execution_id: str) -> Any:
+            raise RuntimeError(f"command not found: {execution_id}")
+
+    monkeypatch.setattr(
+        opensandbox_provider,
+        "_require_opensandbox_sdk",
+        lambda: (object, object, FakeRunCommandOpts, object, object),
+    )
+    provider = opensandbox_provider.OpenSandboxProvider(
+        connection={"request_timeout_s": 5},
+        probe={"command": None},
+        operations={"background_exec": True},
+    )
+    monkeypatch.setattr(
+        provider,
+        "_collect_lifecycle_diagnostics",
+        AsyncMock(return_value="fingerprint_matches=False; app_dir=missing"),
+    )
+    handle = opensandbox_provider.SandboxHandle(
+        sandbox_id="sandbox-reset",
+        provider_name="opensandbox",
+        raw=SimpleNamespace(commands=FakeCommands()),
+    )
+
+    with pytest.raises(
+        opensandbox_provider.OpenSandboxLifecycleResetError,
+        match="fingerprint_matches=False",
+    ):
+        await provider.exec(handle, "make build", timeout_s=30)
 
 
 @pytest.mark.parametrize(
