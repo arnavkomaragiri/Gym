@@ -54,15 +54,21 @@ gym_harbor_agent:
               cpu: 0.25
               memory_mib: 512
             # OpenSandbox Volume dictionaries. Strings support the per-task
-            # placeholders {environment_name}, {task_id}, and {session_id}.
+            # placeholders {context_id}, {environment_name}, {task_name},
+            # {task_id}, and {session_id}. task_name aliases environment_name.
             volumes: ${oc.create:${oc.env:HARBOR_SANDBOX_VOLUMES,[]}}
           # Relative task environment paths supplied by the image or a volume.
           environment_upload_excludes: ${oc.create:${oc.env:HARBOR_ENVIRONMENT_UPLOAD_EXCLUDES,[]}}
-          # Optional compatibility path for writable copies. Prefer mounting a
-          # task-specific read-only S3 volume directly at /app/data.
+          # Optional compatibility path for writable copies.
           sandbox_path_copies: ${oc.create:${oc.env:HARBOR_SANDBOX_PATH_COPIES,[]}}
+          # Compatibility links prepared after volumes are mounted. With a
+          # direct shared /app workspace, mount task data at sibling /data and
+          # expose it to policy and verifier as /app/data through this link.
+          sandbox_path_symlinks: ${oc.create:${oc.env:HARBOR_SANDBOX_PATH_SYMLINKS,[]}}
           sandbox_metadata:
             harbor-benchmark: ${oc.env:HARBOR_BENCHMARK_NAME,harbor}
+            nemo-gym.nvidia.com/user: ${oc.env:NEMO_GYM_USER,unknown}
+            nemo-gym.nvidia.com/run: ${oc.env:HARBOR_EFS_ARTIFACT_RUN,unscoped}
             # EFS is mounted as a scoped provider volume. Never expose the
             # blanket mount merely to relay policy artifacts.
             nemo.nvidia.com/efs-hostpath: 'false'

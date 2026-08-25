@@ -4,14 +4,17 @@
 """OpenCode agent variants that record agent-process filesystem accesses."""
 
 import base64
+import json
 import shlex
-from pathlib import PurePath
+import sqlite3
+from pathlib import Path, PurePath
 from typing import Any, cast, override
 
 from harbor.agents.installed.opencode import OpenCode
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 from harbor.models.trajectories import Step, Trajectory
+from pydantic import BaseModel, ConfigDict, Field
 
 from responses_api_agents.gym_harbor_agent.alerts import (
     AlertContext,
@@ -23,14 +26,128 @@ from responses_api_agents.gym_harbor_agent.alerts import (
 POLICY_FILE_TRACE_FILENAME = ".policy-fs.trace"
 JUDGE_FILE_TRACE_FILENAME = ".judge-fs.trace"
 _OPENCODE_PORT = 4096
+_OPENCODE_DATABASE_RELATIVE_PATH = Path("opencode/xdg-data/opencode/opencode.db")
 _PREINSTALLED_OPENCODE_CHECK = (
     'set -euo pipefail; test -r "$HOME/.nvm/nvm.sh"; '
     '. "$HOME/.nvm/nvm.sh"; command -v opencode >/dev/null; opencode --version'
 )
 
 
+class OpenCodeProcessRLimitConfig(BaseModel):
+    """Per-process resource limits inherited by OpenCode and its children."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    address_space_mib: int = Field(gt=0)
+
+
 def _is_policy_command(command: str) -> bool:
     return "opencode --model=" in command and " run " in command and "--format=json" in command
+
+
+def _load_session_events(database_path: Path, session_id: str | None) -> list[dict[str, Any]]:
+    """Reconstruct OpenCode's complete persisted session as CLI-shaped events."""
+    connection = sqlite3.connect(
+        f"{database_path.resolve().as_uri()}?mode=ro",
+        uri=True,
+        timeout=10,
+    )
+    try:
+        connection.execute("PRAGMA query_only = ON")
+        connection.execute("PRAGMA busy_timeout = 10000")
+        if session_id is None:
+            row = connection.execute(
+                "SELECT id FROM session WHERE parent_id IS NULL ORDER BY time_created, id LIMIT 1"
+            ).fetchone()
+            session_id = str(row[0]) if row is not None else None
+        if session_id is None:
+            return []
+
+        message_rows = connection.execute(
+            "SELECT id, time_created, data FROM message WHERE session_id = ? ORDER BY time_created, id",
+            (session_id,),
+        ).fetchall()
+        part_rows = connection.execute(
+            "SELECT message_id, time_created, data FROM part WHERE session_id = ? ORDER BY time_created, id",
+            (session_id,),
+        ).fetchall()
+    finally:
+        connection.close()
+
+    parts_by_message: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    for message_id, timestamp, raw_data in part_rows:
+        try:
+            part = json.loads(raw_data)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"Invalid OpenCode part JSON for {message_id}") from error
+        parts_by_message.setdefault(str(message_id), []).append((int(timestamp), part))
+
+    events: list[dict[str, Any]] = []
+    event_type_by_part_type = {
+        "reasoning": "reasoning",
+        "step-finish": "step_finish",
+        "step-start": "step_start",
+        "text": "text",
+        "tool": "tool_use",
+    }
+    for message_id, message_timestamp, raw_data in message_rows:
+        try:
+            info = json.loads(raw_data)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"Invalid OpenCode message JSON for {message_id}") from error
+        message_id = str(message_id)
+        message_parts = parts_by_message.get(message_id, [])
+        common = {
+            "sessionID": session_id,
+            "messageID": message_id,
+            "parentID": info.get("parentID"),
+            "assistantSummary": bool(info.get("summary")),
+        }
+        if info.get("role") == "user":
+            events.append(
+                {
+                    **common,
+                    "type": "user",
+                    "timestamp": int(message_timestamp),
+                    "parts": [part for _timestamp, part in message_parts],
+                }
+            )
+            for timestamp, part in message_parts:
+                if part.get("type") == "compaction":
+                    events.append(
+                        {
+                            **common,
+                            "type": "compaction",
+                            "timestamp": timestamp,
+                            "part": part,
+                        }
+                    )
+            continue
+
+        if info.get("role") != "assistant":
+            continue
+        for timestamp, part in message_parts:
+            event_type = event_type_by_part_type.get(part.get("type"))
+            if event_type is None:
+                continue
+            events.append(
+                {
+                    **common,
+                    "type": event_type,
+                    "timestamp": timestamp,
+                    "part": part,
+                }
+            )
+        if info.get("error"):
+            events.append(
+                {
+                    **common,
+                    "type": "error",
+                    "timestamp": int(info.get("time", {}).get("completed") or message_timestamp),
+                    "error": info["error"],
+                }
+            )
+    return events
 
 
 def _run_with_opencode_server(command: str, port: int) -> str:
@@ -132,6 +249,11 @@ def _trace_command(command: str, trace_filename: str) -> str:
     )
 
 
+def _process_limit_command(command: str, config: OpenCodeProcessRLimitConfig) -> str:
+    address_space_kib = config.address_space_mib * 1024
+    return f"set -e; ulimit -S -v {address_space_kib}; ulimit -H -v {address_space_kib}; {command}"
+
+
 class _OpenCodeTracingEnvironment:
     """Delegate a Harbor environment while wrapping one OpenCode run."""
 
@@ -149,6 +271,30 @@ class _OpenCodeTracingEnvironment:
                 raise RuntimeError("OpenCode run command was issued more than once")
             self.command_wrapped = True
             command = _trace_command(command, self._trace_filename)
+        return await self._environment.exec(command=command, **kwargs)
+
+
+class _OpenCodeProcessLimitEnvironment:
+    """Apply inherited per-process limits to one complete OpenCode run."""
+
+    def __init__(
+        self,
+        environment: BaseEnvironment,
+        config: OpenCodeProcessRLimitConfig,
+    ) -> None:
+        self._environment = environment
+        self._config = config
+        self.command_wrapped = False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._environment, name)
+
+    async def exec(self, command: str, **kwargs: Any) -> Any:
+        if _is_policy_command(command):
+            if self.command_wrapped:
+                raise RuntimeError("OpenCode run command was issued more than once")
+            self.command_wrapped = True
+            command = _process_limit_command(command, self._config)
         return await self._environment.exec(command=command, **kwargs)
 
 
@@ -226,6 +372,7 @@ class AlertedOpenCode(OpenCode):
         *args: Any,
         alert_schedule: dict[str, Any] | AlertScheduleConfig | None = None,
         opencode_port: int = _OPENCODE_PORT,
+        process_rlimits: dict[str, Any] | OpenCodeProcessRLimitConfig | None = None,
         use_preinstalled: bool = False,
         **kwargs: Any,
     ) -> None:
@@ -234,10 +381,15 @@ class AlertedOpenCode(OpenCode):
         self._alert_schedule = (
             AlertScheduleConfig.model_validate(alert_schedule) if alert_schedule is not None else None
         )
+        self._process_rlimits = (
+            OpenCodeProcessRLimitConfig.model_validate(process_rlimits) if process_rlimits is not None else None
+        )
         if not 1 <= opencode_port <= 65535:
             raise ValueError("opencode_port must be between 1 and 65535")
         self._opencode_port = opencode_port
         self._runtime_alert_status: list[dict[str, Any]] | None = None
+        self._session_events: list[dict[str, Any]] | None = None
+        self._session_capture_status: dict[str, Any] | None = None
 
     @override
     async def install(self, environment: BaseEnvironment) -> None:
@@ -257,12 +409,24 @@ class AlertedOpenCode(OpenCode):
         context: AgentContext,
     ) -> None:
         self._runtime_alert_status = None
+        self._session_events = None
+        self._session_capture_status = None
+        limiting_environment = None
+        run_environment = environment
+        if self._process_rlimits is not None:
+            limiting_environment = _OpenCodeProcessLimitEnvironment(
+                environment,
+                self._process_rlimits,
+            )
+            run_environment = cast(BaseEnvironment, limiting_environment)
         if self._alert_schedule is None:
-            await super().run(instruction, environment, context)
+            await super().run(instruction, run_environment, context)
+            if limiting_environment is not None and not limiting_environment.command_wrapped:
+                raise RuntimeError("OpenCode run command was not resource limited")
             return
 
         alerting_environment = _OpenCodeAlertingEnvironment(
-            environment,
+            run_environment,
             self._alert_schedule,
             self._opencode_port,
         )
@@ -277,15 +441,194 @@ class AlertedOpenCode(OpenCode):
                 # Harbor only invokes populate_context_post_run() while the
                 # context is empty, so attach metadata in that hook instead.
                 self._runtime_alert_status = alerting_environment.scheduler.status()
+        if limiting_environment is not None and not limiting_environment.command_wrapped:
+            raise RuntimeError("OpenCode run command was not resource limited")
+
+    @override
+    def _parse_stdout(self) -> list[dict[str, Any]]:
+        stdout_events = super()._parse_stdout()
+        if self._alert_schedule is None:
+            return stdout_events
+
+        session_id = next(
+            (event.get("sessionID") for event in stdout_events if event.get("sessionID")),
+            None,
+        )
+        database_path = self.logs_dir / _OPENCODE_DATABASE_RELATIVE_PATH
+        if not database_path.is_file():
+            self._session_capture_status = {
+                "source": "stdout",
+                "event_count": len(stdout_events),
+                "error": "database_missing",
+            }
+            return stdout_events
+
+        try:
+            session_events = _load_session_events(database_path, session_id)
+        except (OSError, sqlite3.Error, ValueError) as error:
+            self._session_capture_status = {
+                "source": "stdout",
+                "event_count": len(stdout_events),
+                "error": f"{type(error).__name__}: {error}",
+            }
+            return stdout_events
+        if not session_events:
+            self._session_capture_status = {
+                "source": "stdout",
+                "event_count": len(stdout_events),
+                "error": "database_session_empty",
+            }
+            return stdout_events
+
+        self._session_events = session_events
+        self._session_capture_status = {
+            "source": "database",
+            "event_count": len(session_events),
+            "error": None,
+        }
+        return session_events
+
+    def _annotate_alert_outcomes(self) -> None:
+        if self._runtime_alert_status is None or self._alert_schedule is None:
+            return
+        events = self._session_events or []
+        messages_by_name = {
+            f"remaining_{alert.remaining_seconds:g}s": alert.message for alert in self._alert_schedule.alerts
+        }
+        for status in self._runtime_alert_status:
+            expected_message = messages_by_name.get(str(status.get("name")))
+            user_event = (
+                next(
+                    (
+                        event
+                        for event in events
+                        if event.get("type") == "user" and self._user_event_text(event) == expected_message
+                    ),
+                    None,
+                )
+                if expected_message is not None
+                else None
+            )
+            user_message_id = user_event.get("messageID") if user_event is not None else None
+            user_event_index = events.index(user_event) if user_event is not None else -1
+            direct_finishes = [
+                event
+                for event in events
+                if event.get("type") == "step_finish"
+                and event.get("parentID") == user_message_id
+                and not event.get("assistantSummary")
+            ]
+            direct_errors = [
+                event for event in events if event.get("type") == "error" and event.get("parentID") == user_message_id
+            ]
+            direct_finish = direct_finishes[0] if direct_finishes else None
+            finish_part = direct_finish.get("part", {}) if direct_finish is not None else {}
+            tokens = finish_part.get("tokens", {}) if isinstance(finish_part, dict) else {}
+            input_tokens = int(tokens.get("input", 0) or 0) if isinstance(tokens, dict) else 0
+            output_tokens = int(tokens.get("output", 0) or 0) if isinstance(tokens, dict) else 0
+            finish_reason = finish_part.get("reason") if isinstance(finish_part, dict) else None
+            direct_zero_token_length = finish_reason == "length" and input_tokens == 0 and output_tokens == 0
+
+            # A typed input-overflow error causes OpenCode to append a new
+            # compaction user message, summarize the prior session, and then
+            # clone the interrupted user turn for replay. Follow those message
+            # IDs rather than treating the summary itself as the alert reply.
+            direct_error_text = json.dumps(
+                [event.get("error") for event in direct_errors],
+                sort_keys=True,
+            ).lower()
+            direct_context_overflow = any(
+                marker in direct_error_text
+                for marker in (
+                    "context_length_exceeded",
+                    "contextoverflow",
+                    "context overflow",
+                    "maximum context length",
+                )
+            )
+            compaction_event = None
+            if direct_context_overflow:
+                compaction_event = next(
+                    (event for event in events[user_event_index + 1 :] if event.get("type") == "compaction"),
+                    None,
+                )
+            compaction_message_id = compaction_event.get("messageID") if compaction_event is not None else None
+            summary_finishes = [
+                event
+                for event in events
+                if event.get("type") == "step_finish"
+                and event.get("parentID") == compaction_message_id
+                and event.get("assistantSummary")
+            ]
+            replay_user_event = None
+            if compaction_event is not None:
+                compaction_event_index = events.index(compaction_event)
+                replay_user_event = next(
+                    (
+                        event
+                        for event in events[compaction_event_index + 1 :]
+                        if event.get("type") == "user" and self._user_event_text(event) == expected_message
+                    ),
+                    None,
+                )
+            replay_user_message_id = replay_user_event.get("messageID") if replay_user_event is not None else None
+            replay_finishes = [
+                event
+                for event in events
+                if event.get("type") == "step_finish"
+                and event.get("parentID") == replay_user_message_id
+                and not event.get("assistantSummary")
+            ]
+            replay_finish = replay_finishes[0] if replay_finishes else None
+            replay_finish_part = replay_finish.get("part", {}) if replay_finish is not None else {}
+            replay_tokens = replay_finish_part.get("tokens", {}) if isinstance(replay_finish_part, dict) else {}
+            replay_input_tokens = int(replay_tokens.get("input", 0) or 0) if isinstance(replay_tokens, dict) else 0
+            replay_output_tokens = int(replay_tokens.get("output", 0) or 0) if isinstance(replay_tokens, dict) else 0
+            replay_finish_reason = replay_finish_part.get("reason") if isinstance(replay_finish_part, dict) else None
+            replay_zero_token_length = (
+                replay_finish_reason == "length" and replay_input_tokens == 0 and replay_output_tokens == 0
+            )
+            direct_processed = direct_finish is not None and not direct_zero_token_length
+            replay_processed = replay_finish is not None and not replay_zero_token_length
+            status.update(
+                {
+                    "session_user_turn_recorded": user_event is not None,
+                    "session_assistant_turn_recorded": any(
+                        user_message_id is not None
+                        and event.get("parentID") == user_message_id
+                        and event.get("type") in {"step_start", "step_finish", "error"}
+                        for event in events
+                    ),
+                    "session_alert_processed": direct_processed or replay_processed,
+                    "session_direct_finish_reason": finish_reason,
+                    "session_direct_prompt_tokens": input_tokens,
+                    "session_direct_completion_tokens": output_tokens,
+                    "session_direct_context_overflow": direct_context_overflow,
+                    "session_alert_replayed": replay_user_event is not None,
+                    "session_replay_finish_reason": replay_finish_reason,
+                    "session_replay_prompt_tokens": replay_input_tokens,
+                    "session_replay_completion_tokens": replay_output_tokens,
+                    "session_zero_token_length": direct_zero_token_length or replay_zero_token_length,
+                    "session_compaction_recorded": compaction_event is not None,
+                    "session_compaction_completed": bool(summary_finishes),
+                }
+            )
 
     @override
     def populate_context_post_run(self, context: AgentContext) -> None:
         super().populate_context_post_run(context)
         if self._runtime_alert_status is None:
             return
+        self._annotate_alert_outcomes()
         metadata = dict(context.metadata or {})
         metadata["runtime_alerts"] = self._runtime_alert_status
+        metadata["opencode_session_capture"] = self._session_capture_status
         context.metadata = metadata
+        if (
+            any(status.get("delivered") for status in self._runtime_alert_status)
+            and (self._session_capture_status or {}).get("source") != "database"
+        ):
+            raise RuntimeError("OpenCode accepted a runtime alert but its canonical session database was not captured")
 
     @override
     def _convert_events_to_trajectory(

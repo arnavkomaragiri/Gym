@@ -30,6 +30,7 @@ from nemo_gym.global_config import (
 
 
 _ROLLOUT_ID: ContextVar[Optional[str]] = ContextVar("nemo_gym_rollout_id", default=None)
+ROLLOUT_SCOPE_KEY = "nemo_gym.rollout_id"
 
 # A capture id travels as a path segment in ``/ng-rollout/<id>``, so it is limited to what a path
 # segment carries unambiguously. Leading dots are excluded because the id is also a filename
@@ -109,6 +110,12 @@ class RolloutContextMiddleware:
         self._app = app
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        rollout_id = scope.get(ROLLOUT_SCOPE_KEY)
+        if rollout_id is not None:
+            with rollout_context(rollout_id):
+                await self._app(scope, receive, send)
+            return
+
         match = self._PREFIX.match(scope.get("path", "")) if scope.get("type") == "http" else None
         if match is None:
             await self._app(scope, receive, send)

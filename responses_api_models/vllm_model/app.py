@@ -23,7 +23,7 @@ from time import time, time_ns
 from typing import Any, ClassVar, Dict, List, Literal, Optional, Union
 
 from aiohttp.client_exceptions import ClientResponseError
-from fastapi import Request
+from fastapi import HTTPException, Request
 from pydantic import Field
 
 from nemo_gym.base_responses_api_model import (
@@ -45,6 +45,7 @@ from nemo_gym.responses_converter import (
     VLLMConverterResponsesToChatCompletionsState,  # noqa: F401
     split_responses_input_output_items,  # noqa: F401
 )
+from nemo_gym.rollout_correlation import current_rollout_id
 from nemo_gym.server_utils import SESSION_ID_KEY, is_nemo_gym_fastapi_entrypoint
 
 
@@ -194,6 +195,12 @@ class VLLMModelConfig(BaseResponsesAPIModelConfig):
     # endpoint a harness happens to use.
     sampling_overrides: Optional[Dict[str, Any]] = None
 
+    # vLLM reports an oversized input as an HTTP 400. The legacy behavior turns
+    # that into an empty successful completion for clients that treat `length`
+    # as a terminal truncation. Agent harnesses with context compaction need the
+    # typed error so they can compact and retry instead.
+    context_overflow_response: Literal["length", "http_error"] = "length"
+
     # Corresponds to the extra_body of OpenAI Client.
     extra_body: Optional[Dict[str, Any]] = None
 
@@ -237,6 +244,29 @@ class VLLMModelConfig(BaseResponsesAPIModelConfig):
 
 class VLLMModel(SimpleResponsesAPIModel):
     config: VLLMModelConfig
+
+    def _handle_context_overflow(self, error: ClientResponseError) -> NeMoGymChatCompletion:
+        if self.config.context_overflow_response == "length":
+            response = self._create_empty_chat_completion()
+            response.choices[0].finish_reason = "length"
+            return response
+
+        raw_body = error.response_content.decode(errors="replace")
+        try:
+            upstream = json.loads(raw_body)
+        except json.JSONDecodeError:
+            upstream = None
+        upstream_error = upstream.get("error") if isinstance(upstream, dict) else None
+        message = upstream_error.get("message") if isinstance(upstream_error, dict) else None
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": message or raw_body or "Input exceeds the model context window",
+                "type": "invalid_request_error",
+                "param": "input_tokens",
+                "code": "context_length_exceeded",
+            },
+        ) from error
 
     def get_converter(self) -> "VLLMConverter":
         """Return the converter used for Responses API <-> Chat Completions mapping.
@@ -627,6 +657,7 @@ class VLLMModel(SimpleResponsesAPIModel):
         body_dict = self._preprocess_chat_completion_create_params(request, body_dict)
 
         client = self._resolve_client(request)
+        replica_id = self._replica_id(client)
         if not self.config.sequential_reasoning_allowed:
             last_message = body_dict["messages"][-1]
             if last_message["role"] == "assistant" and not (last_message["content"] or last_message.get("tool_calls")):
@@ -695,9 +726,7 @@ class VLLMModel(SimpleResponsesAPIModel):
                 "context length" in result_content_str or "max_tokens" in result_content_str
             )
             if is_out_of_context_length:
-                res = self._create_empty_chat_completion()
-                res.choices[0].finish_reason = "length"
-                return res
+                return self._handle_context_overflow(e)
             else:
                 raise e
         except Exception as e:
@@ -734,6 +763,7 @@ class VLLMModel(SimpleResponsesAPIModel):
             )
 
         choice_dict = chat_completion_dict["choices"][0]
+        choice_dict["message"]["ng_generation_replica_id"] = replica_id
         if self.config.uses_reasoning_parser:
             # See the TODO wrt reasoning_content above
             reasoning_content = choice_dict["message"].get("reasoning_content") or choice_dict["message"].get(
@@ -870,6 +900,7 @@ class VLLMModel(SimpleResponsesAPIModel):
         completion_body = self._build_completion_body_from_chat_body(body_dict, prompt)
 
         client = self._resolve_client(request)
+        replica_id = self._replica_id(client)
 
         try:
             completion_dict = await client.create_completion(**completion_body)
@@ -879,9 +910,7 @@ class VLLMModel(SimpleResponsesAPIModel):
                 "context length" in result_content_str or "max_tokens" in result_content_str
             )
             if is_out_of_context_length:
-                res = self._create_empty_chat_completion()
-                res.choices[0].finish_reason = "length"
-                return res
+                return self._handle_context_overflow(e)
             raise
 
         if self.config.return_token_id_information:
@@ -896,7 +925,7 @@ class VLLMModel(SimpleResponsesAPIModel):
                 tokenize_response = await client.create_tokenize(**tokenize_body)
                 choice_dict["prompt_token_ids"] = tokenize_response["tokens"]
 
-        return self._completion_dict_to_chat_completion(completion_dict)
+        return self._completion_dict_to_chat_completion(completion_dict, replica_id=replica_id)
 
     def _render_messages_to_prompt(self, messages: List[Dict[str, Any]]) -> str:
         """Convert a chat-style messages list into a flat prompt string.
@@ -1071,7 +1100,9 @@ class VLLMModel(SimpleResponsesAPIModel):
         # so params without a first-class OpenAI completion field (top_k, min_p) pass through.
         return self._apply_sampling_overrides(out)
 
-    def _completion_dict_to_chat_completion(self, completion_dict: Dict[str, Any]) -> NeMoGymChatCompletion:
+    def _completion_dict_to_chat_completion(
+        self, completion_dict: Dict[str, Any], *, replica_id: str | None = None
+    ) -> NeMoGymChatCompletion:
         """Wrap a /v1/completions response as a NeMoGymChatCompletion.
 
         vLLM /v1/completions returns ``choices[i].text``; we lift it into a
@@ -1088,6 +1119,8 @@ class VLLMModel(SimpleResponsesAPIModel):
             "content": text,
             "tool_calls": None,
         }
+        if replica_id is not None:
+            message_dict["ng_generation_replica_id"] = replica_id
 
         if self.config.return_token_id_information:
             logprobs = choice_dict.get("logprobs")
@@ -1159,6 +1192,15 @@ class VLLMModel(SimpleResponsesAPIModel):
         )
 
     def _resolve_client(self, request: Request) -> NeMoGymAsyncOpenAI:
+        rollout_id = current_rollout_id()
+        if rollout_id is not None:
+            digest = hashlib.blake2b(
+                rollout_id.encode("utf-8"),
+                digest_size=8,
+                person=b"nemo-gym",
+            ).digest()
+            return self._clients[int.from_bytes(digest, "big") % len(self._clients)]
+
         session_id = request.session[SESSION_ID_KEY]
         if session_id not in self._session_id_to_client:
             # There is probably a better way to select the endpoint for this request. But this will do for now.
@@ -1168,6 +1210,11 @@ class VLLMModel(SimpleResponsesAPIModel):
         client = self._session_id_to_client[session_id]
 
         return client
+
+    def _replica_id(self, client: NeMoGymAsyncOpenAI) -> str:
+        """Return a stable, non-address-bearing identifier for an upstream."""
+        client_index = next(index for index, candidate in enumerate(self._clients) if candidate is client)
+        return f"vllm-{client_index}"
 
 
 if __name__ == "__main__":

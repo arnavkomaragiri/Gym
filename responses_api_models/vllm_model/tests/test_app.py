@@ -13,9 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
-from typing import Any, Union
+from typing import Any, Literal, Union
 from unittest.mock import AsyncMock, MagicMock
 
+from aiohttp.client_exceptions import ClientResponseError
 from fastapi.testclient import TestClient
 from pytest import MonkeyPatch, mark, raises
 
@@ -52,6 +53,7 @@ from nemo_gym.openai_utils import (
     NeMoGymResponseReasoningItem,
     NeMoGymSummary,
 )
+from nemo_gym.rollout_correlation import rollout_context
 from nemo_gym.server_utils import ServerClient
 from responses_api_models.vllm_model.app import (
     VLLMConverter,
@@ -66,6 +68,35 @@ from responses_api_models.vllm_model.app import (
 # Used for mocking created_at timestamp generation
 FIXED_TIME = 1691418000
 FIXED_UUID = "123"
+
+
+def test_rollout_routing_ignores_session_cookie_and_is_sticky() -> None:
+    config = VLLMModelConfig(
+        host="0.0.0.0",
+        port=8081,
+        base_url=["http://replica-0/v1", "http://replica-1/v1"],
+        api_key="dummy_key",  # pragma: allowlist secret
+        model="dummy_model",
+        entrypoint="",
+        name="",
+        return_token_id_information=False,
+        uses_reasoning_parser=False,
+    )
+    server = VLLMModel(
+        config=config,
+        server_client=MagicMock(spec=ServerClient, global_config_dict={}),
+    )
+    request_a = MagicMock(session={"session_id": "session-a"})
+    request_b = MagicMock(session={"session_id": "session-b"})
+
+    with rollout_context("task-3-rollout-9"):
+        first = server._resolve_client(request_a)
+    with rollout_context("task-3-rollout-9"):
+        second = server._resolve_client(request_b)
+
+    assert first is second
+    assert server._session_id_to_client == {}
+    assert server._replica_id(first) in {"vllm-0", "vllm-1"}
 
 
 def test_transport_io_writer_keeps_full_payload(monkeypatch: MonkeyPatch, tmp_path) -> None:
@@ -715,7 +746,11 @@ PARAMETERIZE_DATA = [
 
 
 class TestApp:
-    def _setup_server(self, monkeypatch: MonkeyPatch):
+    def _setup_server(
+        self,
+        monkeypatch: MonkeyPatch,
+        context_overflow_response: Literal["length", "http_error"] = "length",
+    ):
         config = VLLMModelConfig(
             host="0.0.0.0",
             port=8081,
@@ -726,6 +761,7 @@ class TestApp:
             name="",
             return_token_id_information=False,
             uses_reasoning_parser=False,
+            context_overflow_response=context_overflow_response,
         )
 
         get_global_config_dict_mock = MagicMock()
@@ -736,6 +772,34 @@ class TestApp:
 
     async def test_sanity(self, monkeypatch: MonkeyPatch) -> None:
         self._setup_server(monkeypatch)
+
+    def test_context_overflow_can_remain_a_length_completion(self, monkeypatch: MonkeyPatch) -> None:
+        server = self._setup_server(monkeypatch)
+        error = ClientResponseError(MagicMock(), (), status=400, message="Bad Request")
+        error.response_content = json.dumps({"error": {"message": "maximum context length is 128 tokens"}}).encode()
+        server._clients[0].create_chat_completion = AsyncMock(side_effect=error)
+
+        response = TestClient(server.setup_webserver()).post(
+            "/v1/chat/completions",
+            json={"model": "dummy_model", "messages": [{"role": "user", "content": "hello"}]},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["choices"][0]["finish_reason"] == "length"
+
+    def test_context_overflow_can_be_preserved_as_http_error(self, monkeypatch: MonkeyPatch) -> None:
+        server = self._setup_server(monkeypatch, context_overflow_response="http_error")
+        error = ClientResponseError(MagicMock(), (), status=400, message="Bad Request")
+        error.response_content = json.dumps({"error": {"message": "maximum context length is 128 tokens"}}).encode()
+        server._clients[0].create_chat_completion = AsyncMock(side_effect=error)
+
+        response = TestClient(server.setup_webserver()).post(
+            "/v1/chat/completions",
+            json={"model": "dummy_model", "messages": [{"role": "user", "content": "hello"}]},
+        )
+
+        assert response.status_code == 400
+        assert response.json()["detail"]["code"] == "context_length_exceeded"
 
     def test_responses_multistep(self, monkeypatch: MonkeyPatch):
         server = self._setup_server(monkeypatch)

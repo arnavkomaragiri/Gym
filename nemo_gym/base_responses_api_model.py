@@ -60,7 +60,11 @@ from nemo_gym.responses_streaming import (
     synthesize_responses_sse,
     validate_streaming_responses_params,
 )
-from nemo_gym.rollout_correlation import maybe_rollout_id_from_run_body
+from nemo_gym.rollout_correlation import (
+    ROLLOUT_SCOPE_KEY,
+    RolloutContextMiddleware,
+    maybe_rollout_id_from_run_body,
+)
 from nemo_gym.rollout_observability import AgentObservationBundle, ObservationGap, join_model_call_observations
 from nemo_gym.server_utils import (
     BaseRunServerInstanceConfig,
@@ -1081,7 +1085,9 @@ class _CaptureMiddleware:
         token_store: Any = None,
         configured_sink: Any = None,
     ) -> None:
-        self._app = app
+        # Capture owns prefix stripping, then the inner middleware exposes the
+        # correlated rollout to model-server endpoint selection.
+        self._app = RolloutContextMiddleware(app)
         self._store = store
         self._model_server_name = model_server_name
         # When set, correlated+observed calls also record training tokens via a per-request sink.
@@ -1100,7 +1106,12 @@ class _CaptureMiddleware:
         if prefix_match:
             rollout_from_path = prefix_match.group("rollout_id")
             path = prefix_match.group("rest")
-            scope = {**scope, "path": path, "raw_path": path.encode("utf-8")}
+            scope = {
+                **scope,
+                "path": path,
+                "raw_path": path.encode("utf-8"),
+                ROLLOUT_SCOPE_KEY: rollout_from_path,
+            }
 
         dialect = _OBSERVED_PATHS.get(path)
 

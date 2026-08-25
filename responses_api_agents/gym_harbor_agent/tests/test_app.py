@@ -20,6 +20,7 @@ from responses_api_agents.gym_harbor_agent.app import (
     _policy_agent_timed_out,
     _policy_alert_metrics,
     _sandbox_cleanup_failed,
+    _validated_judge_score_integrity_metrics,
     _verifier_file_access_audit_metrics,
 )
 
@@ -30,7 +31,21 @@ def test_failure_class_preserves_sandbox_lifecycle_reset_through_wrapper():
     )
 
     assert _failure_class_for_error(error) == "sandbox_lifecycle_reset"
+    assert (
+        _failure_class_for_error(RuntimeError("Get command status failed: HTTP 502: backend is unreachable"))
+        == "sandbox_backend_unreachable"
+    )
     assert _failure_class_for_error(RuntimeError("judge failed")) == "harbor_failed"
+
+
+def test_missing_judge_integrity_does_not_mask_absent_verifier_result(tmp_path: Path) -> None:
+    trajectory_path = tmp_path / "steps" / "rollout" / "agent" / "trajectory.json"
+    trajectory_path.parent.mkdir(parents=True)
+    trajectory_path.write_text("{}")
+    trial = SimpleNamespace(verifier_result=None)
+
+    with pytest.raises(RuntimeError, match="did not produce a result or a host score-integrity verdict"):
+        _validated_judge_score_integrity_metrics(trial, [trajectory_path])
 
 
 def make_config(tmp_path: Path) -> HarborAgentConfig:
@@ -187,6 +202,24 @@ def test_policy_alert_deadline_also_sets_harbor_timeout(tmp_path: Path) -> None:
     assert agent.kwargs["alert_schedule"] == config.policy_alerts.model_dump(mode="json")
 
 
+def test_config_rejects_unknown_sandbox_template_before_rollout_dispatch(tmp_path: Path) -> None:
+    raw_config = make_config(tmp_path).model_dump()
+    raw_config["environment"]["kwargs"] = {
+        "sandbox_provider_options": {
+            "volumes": [
+                {
+                    "name": "problem-data",
+                    "host": {"path": "/mnt/s3/data/train/{task_nmae}"},
+                    "mountPath": "/app/data",
+                }
+            ]
+        }
+    }
+
+    with pytest.raises(ValueError, match=r"environment.kwargs.sandbox_provider_options.*\{task_nmae\}"):
+        HarborAgentConfig.model_validate(raw_config)
+
+
 def test_policy_alert_metrics_summarize_agent_context() -> None:
     trial = SimpleNamespace(
         agent_result=SimpleNamespace(
@@ -207,6 +240,34 @@ def test_policy_alert_metrics_summarize_agent_context() -> None:
         "policy_alert_delivery_rate": 0.5,
         "policy_alert_all_delivered": False,
     }
+
+
+def test_policy_alert_metrics_distinguish_capture_from_zero_token_length() -> None:
+    trial = SimpleNamespace(
+        agent_result=SimpleNamespace(
+            metadata={
+                "runtime_alerts": [
+                    {
+                        "delivered": True,
+                        "attempts": 1,
+                        "session_user_turn_recorded": True,
+                        "session_assistant_turn_recorded": True,
+                        "session_alert_processed": False,
+                        "session_zero_token_length": True,
+                        "session_compaction_completed": False,
+                    }
+                ]
+            }
+        ),
+        step_results=None,
+    )
+
+    metrics = _policy_alert_metrics(trial)
+
+    assert metrics["policy_alert_session_recorded_count"] == 1
+    assert metrics["policy_alert_session_responded_count"] == 0
+    assert metrics["policy_alert_zero_token_length_count"] == 1
+    assert metrics["policy_alert_compaction_completed_count"] == 0
 
 
 def test_audited_opencode_uses_gym_model_server_provider(tmp_path: Path) -> None:
@@ -304,6 +365,7 @@ def test_file_access_audit_fails_when_trace_is_missing(tmp_path: Path) -> None:
 def test_build_job_config_scopes_task_and_forces_environment_cleanup(tmp_path: Path) -> None:
     config = make_config(tmp_path)
     config.environment_build_timeout_multiplier = 3.0
+    config.environment.kwargs = {"sandbox_provider": {"opensandbox": {"connection": {"api_key": "resolved-secret"}}}}
     config.verifier = VerifierConfig(
         import_path=("responses_api_agents.gym_harbor_agent.agentic_verifier:AgenticVerifier"),
         kwargs={"config": {"judge_agent": {"name": "nop"}}},
@@ -318,6 +380,10 @@ def test_build_job_config_scopes_task_and_forces_environment_cleanup(tmp_path: P
     assert job.datasets[0].task_names == ["bbh-task"]
     assert job.agents == [agent]
     assert job.environment.delete is True
+    assert job.environment.kwargs["sandbox_provider"]["opensandbox"]["connection"]["api_key"] == (
+        "${OPENSANDBOX_API_KEY}"
+    )
+    assert config.environment.kwargs["sandbox_provider"]["opensandbox"]["connection"]["api_key"] == ("resolved-secret")
     assert job.verifier == config.verifier
     assert job.artifacts == config.artifacts
     assert job.environment_build_timeout_multiplier == 3.0
@@ -438,13 +504,17 @@ def test_opensandbox_config_separates_requests_from_limits(monkeypatch) -> None:
         "HARBOR_SANDBOX_VOLUMES",
         (
             '[{"name":"problem-data","host":{"path":"/mnt/s3/data/train/'
-            '{environment_name}/environment/data"},"mountPath":"/app/data",'
+            '{environment_name}/environment/data"},"mountPath":"/data",'
             '"readOnly":true}]'
         ),
     )
     monkeypatch.setenv(
         "HARBOR_SANDBOX_PATH_COPIES",
-        '[{"source":"/mnt/task-data","destination":"/app/data"}]',
+        '[{"source":"/mnt/task-data","destination":"/app/copied-data"}]',
+    )
+    monkeypatch.setenv(
+        "HARBOR_SANDBOX_PATH_SYMLINKS",
+        '[{"source":"/data","destination":"/app/data"}]',
     )
 
     config = OmegaConf.merge(
@@ -467,7 +537,7 @@ def test_opensandbox_config_separates_requests_from_limits(monkeypatch) -> None:
             {
                 "name": "problem-data",
                 "host": {"path": ("/mnt/s3/data/train/{environment_name}/environment/data")},
-                "mountPath": "/app/data",
+                "mountPath": "/data",
                 "readOnly": True,
             }
         ],
@@ -499,12 +569,19 @@ def test_opensandbox_config_separates_requests_from_limits(monkeypatch) -> None:
     assert operations["background_exec"] is True
     assert operations["background_poll_interval_s"] == 10.0
     assert operations["background_poll_initial_s"] == 0.25
+    assert operations["background_request_timeout_s"] == 30
+    assert operations["background_request_retries"] == 0
     assert operations["command_retries"] == 0
     assert environment["kwargs"]["exec_shell"] == "bash -lc"
-    assert environment["kwargs"]["sandbox_path_copies"] == [{"source": "/mnt/task-data", "destination": "/app/data"}]
+    assert environment["kwargs"]["sandbox_path_copies"] == [
+        {"source": "/mnt/task-data", "destination": "/app/copied-data"}
+    ]
+    assert environment["kwargs"]["sandbox_path_symlinks"] == [{"source": "/data", "destination": "/app/data"}]
     assert environment["kwargs"]["sandbox_metadata"] == {
         "harbor-benchmark": "harbor",
-        "nemo.nvidia.com/efs-hostpath": "true",
+        "nemo-gym.nvidia.com/user": "unknown",
+        "nemo-gym.nvidia.com/run": "unscoped",
+        "nemo.nvidia.com/efs-hostpath": "false",
         "nemo.nvidia.com/s3-hostpath": "false",
     }
 
@@ -533,12 +610,9 @@ def test_agentic_verifier_config_keeps_policy_and_judge_agents_independent(
     assert verifier["import_path"].endswith(":AgenticVerifier")
     judge = verifier["kwargs"]["config"]["judge_agent"]
     assert judge["name"] is None
-    assert judge["import_path"].endswith(":AuditedOpenCode")
+    assert judge["import_path"].endswith(":PreinstalledOpenCode")
     assert judge["model_name"] == "judge-model"
-    assert judge["kwargs"] == {
-        "use_preinstalled": True,
-        "trace_filename": ".judge-fs.trace",
-    }
+    assert judge["kwargs"] == {"use_preinstalled": True}
     assert verifier["kwargs"]["config"]["judge_opencode_provider"] == {
         "api_mode": "responses",
         "base_url": "https://judge.test/v1",
@@ -548,14 +622,7 @@ def test_agentic_verifier_config_keeps_policy_and_judge_agents_independent(
         "OPENAI_BASE_URL": "RUBRIC_MODEL_API_BASE",
     }
     assert agent_config["artifacts"] == [{"source": "/app", "exclude": ["data", ".opencode"]}]
-    assert agent_config["verifier_file_access_audit"] == {
-        "trace_subdir": "judge",
-        "trace_filename": ".judge-fs.trace",
-        "audited_paths": {
-            "policy_artifacts": "/app",
-            "efs": "/mnt/efs-data",
-        },
-    }
+    assert agent_config.get("verifier_file_access_audit") is None
 
 
 def test_honeypot_audit_config_is_independent_of_task_data_transport(monkeypatch) -> None:
@@ -607,12 +674,35 @@ def test_policy_alert_and_honeypot_overlays_compose(monkeypatch) -> None:
     assert [alert["remaining_seconds"] for alert in agent_config["policy_alerts"]["alerts"]] == [600, 300]
 
 
-def test_efs_artifact_transfer_config(monkeypatch) -> None:
+def test_policy_alert_deadline_cannot_exceed_sandbox_exec_timeout(tmp_path: Path) -> None:
+    raw_config = make_config(tmp_path).model_dump(mode="python")
+    raw_config["agent"] = {
+        "name": None,
+        "import_path": ALERTED_OPENCODE_IMPORT_PATH,
+        "model_name": "nemo/test-model",
+    }
+    raw_config["environment"]["kwargs"] = {"default_exec_timeout_s": 3600}
+    raw_config["policy_alerts"] = {
+        "deadline_seconds": 6000,
+        "alerts": [{"remaining_seconds": 300, "message": "Finish now."}],
+    }
+
+    with pytest.raises(
+        ValueError,
+        match="policy_alerts.deadline_seconds cannot exceed environment.kwargs.default_exec_timeout_s",
+    ):
+        HarborAgentConfig.model_validate(raw_config)
+
+
+def test_efs_direct_shared_workspace_config(monkeypatch) -> None:
     gym_root = Path(__file__).resolve().parents[3]
-    monkeypatch.setenv("HARBOR_EFS_ARTIFACT_ROOT", "/mnt/efs-data/test-artifacts")
-    monkeypatch.setenv("HARBOR_EFS_ARTIFACT_SOURCES", "[/app]")
+    monkeypatch.setenv(
+        "HARBOR_EFS_ARTIFACT_SOURCE_PATH",
+        "/mnt/efs/data/shared/akomaragiri/test-run/{context_id}",
+    )
     monkeypatch.setenv("HARBOR_EFS_ARTIFACT_TIMEOUT_S", "321")
-    monkeypatch.setenv("HARBOR_EFS_ARTIFACT_STALE_AFTER_S", "654")
+    monkeypatch.setenv("HARBOR_EFS_CLEANUP_TIMEOUT_S", "654")
+    monkeypatch.setenv("HARBOR_EFS_CLEANUP_TTL_S", "987")
     config = OmegaConf.merge(
         OmegaConf.load(gym_root / "responses_api_agents/gym_harbor_agent/configs/harbor_agent_opensandbox.yaml"),
         OmegaConf.load(
@@ -621,11 +711,15 @@ def test_efs_artifact_transfer_config(monkeypatch) -> None:
     )
     environment = config.gym_harbor_agent.responses_api_agents.gym_harbor_agent.environment
 
-    assert OmegaConf.to_container(environment.kwargs.shared_artifact_transfer, resolve=True) == {
-        "root": "/mnt/efs-data/test-artifacts",
-        "sources": ["/app"],
-        "timeout_s": 321,
-        "stale_after_s": 654,
+    assert OmegaConf.to_container(environment.kwargs.shared_workspace, resolve=True) == {
+        "volume": {
+            "name": "harbor-policy-workspace",
+            "host": {"path": "/mnt/efs/data/shared/akomaragiri/test-run/{context_id}"},
+            "mountPath": "/app",
+        },
+        "handoff_timeout_s": 321,
+        "cleanup_timeout_s": 654,
+        "cleanup_ttl_s": 987,
     }
 
 
@@ -650,7 +744,7 @@ async def test_run_job_recovers_completed_trial_when_only_cleanup_times_out(
             exception_message=("Timed out during OpenSandbox kill after 30s; sandbox_id='test'"),
         ),
         verifier_result=SimpleNamespace(rewards={"reward": 0.5}),
-        step_results=[SimpleNamespace(step_name="rollout")],
+        step_results=[SimpleNamespace(step_name="rollout", exception_info=None)],
     )
     job = SimpleNamespace(run=AsyncMock())
 
@@ -668,3 +762,48 @@ async def test_run_job_recovers_completed_trial_when_only_cleanup_times_out(
 
     assert recovered == str(trial_dir.resolve())
     assert (trial_dir / "result.json").is_file()
+
+
+@pytest.mark.asyncio
+async def test_run_job_rejects_opensandbox_infra_failure_recorded_on_step(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    job_config = config.build_job_config(
+        "bbh-task",
+        "t0-r0",
+        AgentConfig(name="opencode", model_name="nemo/test-model"),
+    )
+    trial_dir = job_config.jobs_dir / job_config.job_name / "trial"
+    trial_dir.mkdir(parents=True)
+    result_path = trial_dir / "result.json"
+    result_path.write_text("{}")
+    trial_result = SimpleNamespace(
+        exception_info=None,
+        verifier_result=SimpleNamespace(rewards={"reward": 0.0}),
+        step_results=[
+            SimpleNamespace(
+                step_name="rollout",
+                exception_info=SimpleNamespace(
+                    exception_type="SandboxApiException",
+                    exception_message=(
+                        "Get command status failed: HTTP 502: Could not connect to backend sandbox endpoint"
+                    ),
+                ),
+            )
+        ],
+    )
+    job = SimpleNamespace(run=AsyncMock())
+
+    with (
+        patch(
+            "responses_api_agents.gym_harbor_agent.app.Job.create",
+            new=AsyncMock(return_value=job),
+        ),
+        patch(
+            "responses_api_agents.gym_harbor_agent.app.TrialResult.model_validate_json",
+            return_value=trial_result,
+        ),
+        pytest.raises(RuntimeError, match="Get command status failed: HTTP 502"),
+    ):
+        await HarborAgent.run_job(job_config.model_dump(mode="json"))
+
+    assert not result_path.exists()

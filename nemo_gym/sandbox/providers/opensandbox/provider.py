@@ -16,6 +16,7 @@
 
 import asyncio
 import logging
+import os
 import re
 import shlex
 import ssl
@@ -98,6 +99,7 @@ RETRYABLE_ERROR_MARKERS = (
     "timeout",
 )
 METADATA_VALUE_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+ENV_REFERENCE_RE = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
 # Kubernetes prefixed-key namespace for auto-injected attribution labels (team/user/workload/run).
 DEFAULT_ATTRIBUTION_KEY_PREFIX = "nemo-gym.nvidia.com/"
 # Kubernetes label-key prefixes must be DNS-1123 subdomains (max 253 chars).
@@ -496,6 +498,11 @@ class OpenSandboxOperationConfig:
     # Backs off from initial to interval.
     background_poll_initial_s: float = 0.25
     background_poll_interval_s: float = 2.0
+    # Bound each status/log request independently of the general API timeout.
+    # A dead sandbox exec backend should fail the rollout promptly instead of
+    # consuming the command's full wall-clock budget in a retry loop.
+    background_request_timeout_s: float = 30.0
+    background_request_retries: int = 0
 
     def __post_init__(self) -> None:
         if self.retries < 0:
@@ -512,6 +519,10 @@ class OpenSandboxOperationConfig:
             raise ValueError("operations.background_poll_interval_s must be > 0")
         if self.background_poll_initial_s <= 0:
             raise ValueError("operations.background_poll_initial_s must be > 0")
+        if self.background_request_timeout_s <= 0:
+            raise ValueError("operations.background_request_timeout_s must be > 0")
+        if self.background_request_retries < 0:
+            raise ValueError("operations.background_request_retries must be >= 0")
 
 
 @dataclass(frozen=True)
@@ -595,6 +606,12 @@ class OpenSandboxProvider:
         attribution: OpenSandboxAttributionConfig | Mapping[str, Any] | None = None,
     ) -> None:
         self._connection = _coerce_config(connection, OpenSandboxConnectionConfig)
+        if self._connection.api_key is not None and (match := ENV_REFERENCE_RE.fullmatch(self._connection.api_key)):
+            variable_name = match.group(1)
+            value = os.environ.get(variable_name)
+            if not value:
+                raise ValueError(f"OpenSandbox API key environment variable {variable_name!r} is not set")
+            self._connection = replace(self._connection, api_key=value)
         self._create = _coerce_config(create, OpenSandboxCreateConfig)
         self._probe = _coerce_config(probe, OpenSandboxProbeConfig)
         self._operations = _coerce_config(operations, OpenSandboxOperationConfig)
@@ -1236,6 +1253,84 @@ class OpenSandboxProvider:
                 f"(sandbox_id={handle.sandbox_id!r})"
             ) from e
 
+    async def _interrupt_background_execution(
+        self,
+        handle: SandboxHandle,
+        execution_id: str,
+        *,
+        reason: str,
+    ) -> None:
+        """Best-effort interrupt and termination confirmation for one execution."""
+        request_timeout_s = min(
+            self._operations.background_request_timeout_s,
+            self._operations.close_timeout_s,
+        )
+        if self._connection.request_timeout_s is not None:
+            request_timeout_s = min(
+                request_timeout_s,
+                float(self._connection.request_timeout_s),
+            )
+
+        try:
+            await self._await_sdk_operation(
+                lambda: handle.raw.commands.interrupt(execution_id),
+                operation="command interrupt",
+                sandbox_id=handle.sandbox_id,
+                timeout_s=request_timeout_s,
+                retries=0,
+            )
+        except Exception as error:  # noqa: BLE001 - preserve the initiating error
+            LOGGER.warning(
+                "Failed to interrupt OpenSandbox background command after %s; "
+                "sandbox_id=%r, execution_id=%r, error=%r",
+                reason,
+                handle.sandbox_id,
+                execution_id,
+                error,
+            )
+            return
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._operations.close_timeout_s
+        while True:
+            try:
+                status = await self._await_sdk_operation(
+                    lambda: handle.raw.commands.get_command_status(execution_id),
+                    operation="command status after interrupt",
+                    sandbox_id=handle.sandbox_id,
+                    timeout_s=request_timeout_s,
+                    retries=0,
+                )
+            except Exception as error:  # noqa: BLE001 - cleanup remains best effort
+                LOGGER.warning(
+                    "Could not confirm interrupted OpenSandbox command termination; "
+                    "sandbox_id=%r, execution_id=%r, error=%r",
+                    handle.sandbox_id,
+                    execution_id,
+                    error,
+                )
+                return
+
+            running = getattr(status, "running", None)
+            if running is False:
+                return
+            if running is None:
+                LOGGER.warning(
+                    "OpenSandbox interrupted-command status has no 'running' field; sandbox_id=%r, execution_id=%r",
+                    handle.sandbox_id,
+                    execution_id,
+                )
+                return
+            remaining_s = deadline - loop.time()
+            if remaining_s <= 0:
+                LOGGER.warning(
+                    "OpenSandbox background command remained running after interrupt; sandbox_id=%r, execution_id=%r",
+                    handle.sandbox_id,
+                    execution_id,
+                )
+                return
+            await asyncio.sleep(min(0.25, remaining_s))
+
     async def _exec_background(
         self,
         handle: SandboxHandle,
@@ -1267,25 +1362,73 @@ class OpenSandboxProvider:
         if not execution_id:
             raise RuntimeError("OpenSandbox background command did not return an execution id")
 
-        loop = asyncio.get_running_loop()
-        # The server enforces the command timeout; leave the client headroom.
-        deadline = (loop.time() + float(total_timeout_s) + 60.0) if total_timeout_s is not None else None
-        poll_timeout_s = (
-            float(self._connection.request_timeout_s) if self._connection.request_timeout_s is not None else 60.0
-        )
+        execution_running = True
+        try:
+            loop = asyncio.get_running_loop()
+            # The server enforces the command timeout; leave the client headroom.
+            deadline = (loop.time() + float(total_timeout_s) + 60.0) if total_timeout_s is not None else None
+            poll_timeout_s = self._operations.background_request_timeout_s
+            if self._connection.request_timeout_s is not None:
+                poll_timeout_s = min(poll_timeout_s, float(self._connection.request_timeout_s))
 
-        # Poll fast at first so the many short commands an agent issues are
-        # detected promptly, then back off so long ones do not spam requests.
-        poll_interval = min(self._operations.background_poll_initial_s, self._operations.background_poll_interval_s)
-        polling_started_at = time.monotonic()
-        while True:
+            # Poll fast at first so the many short commands an agent issues are
+            # detected promptly, then back off so long ones do not spam requests.
+            poll_interval = min(
+                self._operations.background_poll_initial_s,
+                self._operations.background_poll_interval_s,
+            )
+            polling_started_at = time.monotonic()
+            while True:
+                try:
+                    status = await self._await_sdk_operation(
+                        lambda: handle.raw.commands.get_command_status(execution_id),
+                        operation="command status",
+                        sandbox_id=handle.sandbox_id,
+                        timeout_s=poll_timeout_s,
+                        retries=self._operations.background_request_retries,
+                    )
+                except Exception as error:
+                    if not self._is_missing_background_command_error(error):
+                        raise
+                    diagnostics = await self._collect_lifecycle_diagnostics(handle)
+                    elapsed_s = time.monotonic() - polling_started_at
+                    message = (
+                        "OpenSandbox background command state disappeared; treating the sandbox as "
+                        "restarted or rebound instead of replaying the command in place. "
+                        f"sandbox_id={handle.sandbox_id!r}, execution_id={execution_id!r}, "
+                        f"poll_elapsed_s={elapsed_s:.1f}; {diagnostics}"
+                    )
+                    LOGGER.error(message)
+                    raise OpenSandboxLifecycleResetError(message) from error
+                # A renamed SDK field must not degrade silently: a missing `running`
+                # would end the poll at once, a missing `exit_code` would score a
+                # failed command as a success.
+                for field in ("running", "exit_code"):
+                    if not hasattr(status, field):
+                        raise RuntimeError(f"OpenSandbox status has no {field!r} field; execution_id={execution_id!r}")
+                if not status.running:
+                    execution_running = False
+                    break
+                if deadline is not None and loop.time() >= deadline:
+                    raise TimeoutError(
+                        f"Timed out polling OpenSandbox background command; sandbox_id={handle.sandbox_id!r}, "
+                        f"execution_id={execution_id!r}"
+                    )
+                await asyncio.sleep(poll_interval)
+                poll_interval = min(
+                    poll_interval * 1.5,
+                    self._operations.background_poll_interval_s,
+                )
+
+            # The execution has finished, so one call returns its whole buffer;
+            # the cursor is the end offset rather than a more-data flag.
             try:
-                status = await self._await_sdk_operation(
-                    lambda: handle.raw.commands.get_command_status(execution_id),
-                    operation="command status",
+                logs = await self._await_sdk_operation(
+                    lambda: handle.raw.commands.get_background_command_logs(execution_id),
+                    operation="command logs",
                     sandbox_id=handle.sandbox_id,
                     timeout_s=poll_timeout_s,
-                    retries=self._operations.retries,
+                    retries=self._operations.background_request_retries,
                 )
             except Exception as error:
                 if not self._is_missing_background_command_error(error):
@@ -1293,53 +1436,29 @@ class OpenSandboxProvider:
                 diagnostics = await self._collect_lifecycle_diagnostics(handle)
                 elapsed_s = time.monotonic() - polling_started_at
                 message = (
-                    "OpenSandbox background command state disappeared; treating the sandbox as "
+                    "OpenSandbox background command logs disappeared; treating the sandbox as "
                     "restarted or rebound instead of replaying the command in place. "
                     f"sandbox_id={handle.sandbox_id!r}, execution_id={execution_id!r}, "
                     f"poll_elapsed_s={elapsed_s:.1f}; {diagnostics}"
                 )
                 LOGGER.error(message)
                 raise OpenSandboxLifecycleResetError(message) from error
-            # A renamed SDK field must not degrade silently: a missing `running`
-            # would end the poll at once, a missing `exit_code` would score a
-            # failed command as a success.
-            for field in ("running", "exit_code"):
-                if not hasattr(status, field):
-                    raise RuntimeError(f"OpenSandbox status has no {field!r} field; execution_id={execution_id!r}")
-            if not status.running:
-                break
-            if deadline is not None and loop.time() >= deadline:
-                raise TimeoutError(
-                    f"Timed out polling OpenSandbox background command; sandbox_id={handle.sandbox_id!r}, "
-                    f"execution_id={execution_id!r}"
+        except asyncio.CancelledError:
+            if execution_running:
+                await self._interrupt_background_execution(
+                    handle,
+                    execution_id,
+                    reason="client cancellation",
                 )
-            await asyncio.sleep(poll_interval)
-            poll_interval = min(poll_interval * 1.5, self._operations.background_poll_interval_s)
-
-        # The execution has finished, so one call returns its whole buffer; the
-        # cursor this endpoint reports back is the end offset rather than a
-        # more-data flag, so there is no tail to follow.
-        try:
-            logs = await self._await_sdk_operation(
-                lambda: handle.raw.commands.get_background_command_logs(execution_id),
-                operation="command logs",
-                sandbox_id=handle.sandbox_id,
-                timeout_s=poll_timeout_s,
-                retries=self._operations.retries,
-            )
+            raise
         except Exception as error:
-            if not self._is_missing_background_command_error(error):
-                raise
-            diagnostics = await self._collect_lifecycle_diagnostics(handle)
-            elapsed_s = time.monotonic() - polling_started_at
-            message = (
-                "OpenSandbox background command logs disappeared; treating the sandbox as "
-                "restarted or rebound instead of replaying the command in place. "
-                f"sandbox_id={handle.sandbox_id!r}, execution_id={execution_id!r}, "
-                f"poll_elapsed_s={elapsed_s:.1f}; {diagnostics}"
-            )
-            LOGGER.error(message)
-            raise OpenSandboxLifecycleResetError(message) from error
+            if execution_running:
+                await self._interrupt_background_execution(
+                    handle,
+                    execution_id,
+                    reason=type(error).__name__,
+                )
+            raise
         stdout = getattr(logs, "content", None) or None
         status_error = getattr(status, "error", None)
         stderr = status_error or None

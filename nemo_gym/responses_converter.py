@@ -189,6 +189,10 @@ class ResponsesConverter(BaseModel):
                     generation_token_ids=m["generation_token_ids"],
                     generation_log_probs=m["generation_log_probs"],
                     routed_experts=m.get("routed_experts"),
+                    ng_generation_replica_id=m.get("ng_generation_replica_id"),
+                    ng_generation_weight_version=m.get("ng_generation_weight_version"),
+                    ng_kv_cache_scheduler_block_size=m.get("ng_kv_cache_scheduler_block_size"),
+                    ng_kv_cache_hash_block_size=m.get("ng_kv_cache_hash_block_size"),
                 )
 
         state.flush_assistant()
@@ -472,6 +476,14 @@ class ResponsesConverter(BaseModel):
             extra_training_fields = {}
             if "routed_experts" in message_dict and message_dict["routed_experts"] is not None:
                 extra_training_fields["routed_experts"] = message_dict["routed_experts"]
+            for field in (
+                "ng_generation_replica_id",
+                "ng_generation_weight_version",
+                "ng_kv_cache_scheduler_block_size",
+                "ng_kv_cache_hash_block_size",
+            ):
+                if message_dict.get(field) is not None:
+                    extra_training_fields[field] = message_dict[field]
             response_output[-1] = train_cls(
                 **last_response_output_item.model_dump(),
                 prompt_token_ids=message_dict["prompt_token_ids"],

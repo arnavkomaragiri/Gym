@@ -53,6 +53,10 @@ from nemo_gym.openai_utils import (
 )
 from nemo_gym.rollout_collection import NG_FAILURE_CLASS_KEY
 from responses_api_agents.gym_harbor_agent.alerts import AlertScheduleConfig
+from responses_api_agents.harbor_agent.custom_envs.nemo_gym_sandbox.environment import (
+    SharedWorkspaceConfig,
+    validate_sandbox_template_placeholders,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -68,6 +72,11 @@ _SANDBOX_LIFECYCLE_RESET_MARKERS = (
     "OpenSandboxLifecycleResetError",
     "OpenSandbox background command state disappeared",
 )
+_SANDBOX_BACKEND_UNREACHABLE_MARKERS = (
+    "Get command status failed: HTTP 502",
+    "Could not connect to backend sandbox endpoint",
+)
+_OPENSANDBOX_API_KEY_ENV_REFERENCE = "${OPENSANDBOX_API_KEY}"
 
 _RAY_WORKER_EVENT_LOOP: asyncio.AbstractEventLoop | None = None
 
@@ -93,7 +102,24 @@ def _failure_class_for_error(error: Exception) -> str:
     rendered = f"{type(error).__name__}: {error}"
     if any(marker in rendered for marker in _SANDBOX_LIFECYCLE_RESET_MARKERS):
         return "sandbox_lifecycle_reset"
+    if any(marker in rendered for marker in _SANDBOX_BACKEND_UNREACHABLE_MARKERS):
+        return "sandbox_backend_unreachable"
     return "harbor_failed"
+
+
+def _sandbox_step_infra_error(trial: TrialResult) -> str | None:
+    """Return only policy-step failures known to originate in OpenSandbox infra."""
+    for step in trial.step_results or []:
+        exception_info = step.exception_info
+        if exception_info is None:
+            continue
+        rendered = f"{exception_info.exception_type}: {exception_info.exception_message}"
+        if any(
+            marker in rendered
+            for marker in (*_SANDBOX_LIFECYCLE_RESET_MARKERS, *_SANDBOX_BACKEND_UNREACHABLE_MARKERS)
+        ):
+            return rendered
+    return None
 
 
 def _is_opencode_agent(agent: AgentConfig) -> bool:
@@ -128,13 +154,30 @@ def _policy_alert_metrics(trial: TrialResult) -> dict[str, int | float | bool]:
 
     delivered = sum(bool(status.get("delivered")) for status in statuses)
     attempted = sum(int(status.get("attempts", 0)) > 0 for status in statuses)
-    return {
+    metrics: dict[str, int | float | bool] = {
         "policy_alert_count": len(statuses),
         "policy_alert_attempted_count": attempted,
         "policy_alert_delivered_count": delivered,
         "policy_alert_delivery_rate": delivered / len(statuses),
         "policy_alert_all_delivered": delivered == len(statuses),
     }
+    session_statuses = [status for status in statuses if "session_user_turn_recorded" in status]
+    if session_statuses:
+        recorded = sum(bool(status.get("session_user_turn_recorded")) for status in session_statuses)
+        responded = sum(bool(status.get("session_alert_processed")) for status in session_statuses)
+        zero_token_length = sum(bool(status.get("session_zero_token_length")) for status in session_statuses)
+        compacted = sum(bool(status.get("session_compaction_completed")) for status in session_statuses)
+        metrics.update(
+            {
+                "policy_alert_session_recorded_count": recorded,
+                "policy_alert_session_record_rate": recorded / len(session_statuses),
+                "policy_alert_session_responded_count": responded,
+                "policy_alert_session_response_rate": responded / len(session_statuses),
+                "policy_alert_zero_token_length_count": zero_token_length,
+                "policy_alert_compaction_completed_count": compacted,
+            }
+        )
+    return metrics
 
 
 class FileAccessAuditConfig(BaseModel):
@@ -361,6 +404,27 @@ def _judge_score_integrity_metrics(trajectory_paths: list[Path]) -> dict[str, bo
     }
 
 
+def _validated_judge_score_integrity_metrics(
+    trial: TrialResult,
+    trajectory_paths: list[Path],
+) -> dict[str, bool | int | str]:
+    try:
+        metrics = _judge_score_integrity_metrics(trajectory_paths)
+    except FileNotFoundError as exc:
+        if trial.verifier_result is not None:
+            raise
+        raise RuntimeError(
+            "Agentic verifier did not produce a result or a host score-integrity verdict"
+        ) from exc
+
+    if not metrics["judge_score_terminal"]:
+        reason = metrics["judge_score_integrity_error"] or "judge score was not terminal"
+        raise RuntimeError(f"Agentic verifier score failed host integrity validation: {reason}")
+    if trial.verifier_result is None:
+        raise RuntimeError("Agentic verifier did not produce a result despite a terminal judge score")
+    return metrics
+
+
 @ray.remote(
     scheduling_strategy="SPREAD",
     runtime_env={"py_executable": sys.executable},
@@ -407,6 +471,40 @@ class HarborAgentConfig(BaseResponsesAPIAgentConfig):
             raise ValueError("OpenCode must use a nemo/<model> name when routed through the Gym model server")
         if self.policy_alerts is not None and not _supports_policy_alerts(self.agent):
             raise ValueError("policy_alerts requires AlertedOpenCode or AuditedOpenCode")
+        environment_kwargs = dict(self.environment.kwargs or {})
+        exec_timeout = environment_kwargs.get("default_exec_timeout_s")
+        if (
+            self.policy_alerts is not None
+            and isinstance(exec_timeout, (int, float))
+            and self.policy_alerts.deadline_seconds > exec_timeout
+        ):
+            raise ValueError(
+                "policy_alerts.deadline_seconds cannot exceed "
+                "environment.kwargs.default_exec_timeout_s"
+            )
+        for field_name in (
+            "sandbox_provider_options",
+            "sandbox_path_copies",
+            "sandbox_path_symlinks",
+            "shared_workspace",
+        ):
+            validate_sandbox_template_placeholders(
+                environment_kwargs.get(field_name),
+                context=f"environment.kwargs.{field_name}",
+            )
+        shared_workspace = environment_kwargs.get("shared_workspace")
+        if shared_workspace is not None:
+            workspace_config = SharedWorkspaceConfig.model_validate(shared_workspace)
+            provider_options = environment_kwargs.get("sandbox_provider_options") or {}
+            volumes = provider_options.get("volumes", []) if isinstance(provider_options, dict) else []
+            for volume in volumes:
+                if not isinstance(volume, dict):
+                    continue
+                mount_path = volume.get("mountPath", volume.get("mount_path"))
+                if volume.get("name") == workspace_config.volume.name:
+                    raise ValueError("sandbox_provider_options.volumes duplicates shared workspace volume name")
+                if mount_path == workspace_config.volume.mount_path:
+                    raise ValueError("sandbox_provider_options.volumes duplicates shared workspace mount path")
         return self
 
     def agent_for_model_server(
@@ -459,6 +557,15 @@ class HarborAgentConfig(BaseResponsesAPIAgentConfig):
         return self.agent.model_copy(update=updates)
 
     def build_job_config(self, task_name: str, job_name: str, agent: AgentConfig) -> JobConfig:
+        environment_kwargs = copy.deepcopy(self.environment.kwargs or {})
+        sandbox_provider = environment_kwargs.get("sandbox_provider")
+        if isinstance(sandbox_provider, dict):
+            opensandbox = sandbox_provider.get("opensandbox")
+            if isinstance(opensandbox, dict):
+                connection = opensandbox.get("connection")
+                if isinstance(connection, dict) and connection.get("api_key"):
+                    connection["api_key"] = _OPENSANDBOX_API_KEY_ENV_REFERENCE
+
         return JobConfig(
             job_name=job_name,
             jobs_dir=self.jobs_dir,
@@ -467,7 +574,7 @@ class HarborAgentConfig(BaseResponsesAPIAgentConfig):
             quiet=True,
             retry=RetryConfig(max_retries=0),
             environment_build_timeout_multiplier=self.environment_build_timeout_multiplier,
-            environment=self.environment.model_copy(update={"delete": True}),
+            environment=self.environment.model_copy(update={"delete": True, "kwargs": environment_kwargs}),
             verifier=self.verifier,
             artifacts=self.artifacts,
             agents=[agent],
@@ -609,7 +716,7 @@ class HarborAgent(SimpleResponsesAPIAgent):
             else {}
         )
         score_integrity_metrics = (
-            _judge_score_integrity_metrics(trajectory_paths)
+            _validated_judge_score_integrity_metrics(trial, trajectory_paths)
             if self.config.verifier.import_path == AGENTIC_VERIFIER_IMPORT_PATH
             else {}
         )
@@ -671,6 +778,11 @@ class HarborAgent(SimpleResponsesAPIAgent):
                     continue
 
                 trial_result = TrialResult.model_validate_json(result_path.read_text())
+                step_infra_error = _sandbox_step_infra_error(trial_result)
+                if step_infra_error is not None:
+                    # Force Harbor to replace an infra-failed trial on Gym retry.
+                    result_path.unlink()
+                    raise RuntimeError(f"Harbor agent step failed with {step_infra_error}")
                 if trial_result.exception_info is not None:
                     if _sandbox_cleanup_failed(trial_result) and trial_result.verifier_result is not None:
                         trial_paths = TrialPaths(trial_dir)

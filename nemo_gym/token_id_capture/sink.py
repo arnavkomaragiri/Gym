@@ -114,6 +114,10 @@ async def capture_tokens(response: Any) -> None:
             generation_token_ids=info.get("generation_token_ids") or [],
             generation_log_probs=info.get("generation_log_probs") or [],
             routed_experts=info.get("routed_experts"),
+            ng_generation_replica_id=info.get("ng_generation_replica_id"),
+            ng_generation_weight_version=info.get("ng_generation_weight_version"),
+            ng_kv_cache_scheduler_block_size=info.get("ng_kv_cache_scheduler_block_size"),
+            ng_kv_cache_hash_block_size=info.get("ng_kv_cache_hash_block_size"),
             # Keep the content (assistant text, tool calls) so the trajectory the trainer
             # reads is not token-only, since text-based penalties need it.
             output_items=content_items,

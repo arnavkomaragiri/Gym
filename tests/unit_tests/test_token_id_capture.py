@@ -84,7 +84,35 @@ def test_extract_token_fields_responses_shape():
         "generation_token_ids": GTOKS,
         "generation_log_probs": LPS,
         "routed_experts": None,
+        "ng_generation_replica_id": None,
+        "ng_generation_weight_version": None,
+        "ng_kv_cache_scheduler_block_size": None,
+        "ng_kv_cache_hash_block_size": None,
     }
+
+
+def test_extract_token_fields_keeps_execution_metadata():
+    payload = {
+        "choices": [
+            {
+                "message": {
+                    "prompt_token_ids": PTOKS,
+                    "generation_token_ids": GTOKS,
+                    "generation_log_probs": LPS,
+                    "ng_generation_replica_id": "vllm-2",
+                    "ng_generation_weight_version": 4,
+                    "ng_kv_cache_scheduler_block_size": 1056,
+                    "ng_kv_cache_hash_block_size": 1056,
+                }
+            }
+        ]
+    }
+
+    info = extract_token_fields(payload)
+    assert info is not None
+    assert info["ng_generation_replica_id"] == "vllm-2"
+    assert info["ng_generation_weight_version"] == 4
+    assert info["ng_kv_cache_scheduler_block_size"] == 1056
 
 
 def test_extract_token_fields_chat_shape():

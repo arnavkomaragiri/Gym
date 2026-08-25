@@ -29,6 +29,7 @@ downloads ``/logs`` at the end of the trial via :meth:`download_dir`.
 """
 
 import json
+import re
 import shlex
 import tarfile
 import tempfile
@@ -44,7 +45,7 @@ from harbor.environments.definition import should_upload_environment_dir
 from harbor.models.environment_type import EnvironmentType
 from harbor.models.task.config import NetworkMode
 from harbor.models.trial.paths import EnvironmentPaths
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from nemo_gym.sandbox import (
     AsyncSandbox,
@@ -55,10 +56,49 @@ from nemo_gym.sandbox import (
 )
 
 
-# The sandbox-side scratch directory used for tar-based directory transfer.
+# The sandbox-side scratch directory used for ordinary tar-based directory transfer.
 _TRANSFER_DIR = "/tmp"
-_SHARED_ARTIFACT_MARKER = ".nemo-gym-shared-artifact.json"
-_SHARED_ARTIFACT_SCHEMA_VERSION = 1
+_SHARED_WORKSPACE_MARKER = ".nemo-gym-shared-workspace.json"
+_SHARED_WORKSPACE_SCHEMA_VERSION = 1
+_SHARED_WORKSPACE_CLEANUP_MOUNT = "/nemo-gym-workspace-cleanup"
+_SANDBOX_TEMPLATE_PATTERN = re.compile(r"\{(?P<name>[A-Za-z_][A-Za-z0-9_]*)\}")
+_SUPPORTED_SANDBOX_TEMPLATE_NAMES = frozenset({"context_id", "environment_name", "session_id", "task_id", "task_name"})
+
+
+def validate_sandbox_template_placeholders(
+    value: Any,
+    *,
+    context: str = "sandbox configuration",
+) -> None:
+    """Reject template names the sandbox environment cannot render."""
+
+    unsupported: set[str] = set()
+
+    def collect(item: Any) -> None:
+        if isinstance(item, str):
+            unsupported.update(
+                match.group("name")
+                for match in _SANDBOX_TEMPLATE_PATTERN.finditer(item)
+                if match.group("name") not in _SUPPORTED_SANDBOX_TEMPLATE_NAMES
+            )
+            return
+        if isinstance(item, Mapping):
+            for key, nested in item.items():
+                collect(key)
+                collect(nested)
+            return
+        if isinstance(item, (list, tuple)):
+            for nested in item:
+                collect(nested)
+
+    collect(value)
+    if unsupported:
+        rendered_unsupported = ", ".join(f"{{{name}}}" for name in sorted(unsupported))
+        rendered_supported = ", ".join(f"{{{name}}}" for name in sorted(_SUPPORTED_SANDBOX_TEMPLATE_NAMES))
+        raise ValueError(
+            f"Unsupported template placeholder(s) in {context}: {rendered_unsupported}. "
+            f"Supported placeholders: {rendered_supported}."
+        )
 
 
 class SandboxPathCopy(BaseModel):
@@ -87,58 +127,105 @@ class SandboxPathCopy(BaseModel):
         return self
 
 
-class SharedArtifactTransferConfig(BaseModel, extra="forbid"):
-    """Sandbox-local artifact relay through a filesystem shared by both roles."""
+class SandboxPathSymlink(BaseModel):
+    """Expose one sandbox-visible path through a stable compatibility path."""
 
-    root: str
-    sources: list[str]
-    timeout_s: float = 600
-    stale_after_s: float = 86400
+    model_config = ConfigDict(extra="forbid")
+
+    source: str
+    destination: str
 
     @model_validator(mode="after")
-    def validate_paths(self) -> "SharedArtifactTransferConfig":
-        normalized: list[str] = []
-        for field_name, values in (("root", [self.root]), ("sources", self.sources)):
-            if not values:
-                raise ValueError(f"shared_artifact_transfer.{field_name} must not be empty")
-            for value in values:
-                path = PurePosixPath(value)
-                if (
-                    not path.is_absolute()
-                    or path == PurePosixPath("/")
-                    or any(part in {"", ".", ".."} for part in path.parts)
-                ):
-                    raise ValueError(
-                        f"shared_artifact_transfer.{field_name} entries must be absolute non-root paths "
-                        f"without '.' or '..' components (got {value!r})"
-                    )
-                normalized.append(str(path))
-        self.root = normalized[0]
-        self.sources = normalized[1:]
-        if len(self.sources) != len(set(self.sources)):
-            raise ValueError("shared_artifact_transfer.sources must not contain duplicates")
-        root = PurePosixPath(self.root)
-        if any(
-            root == PurePosixPath(source)
-            or root in PurePosixPath(source).parents
-            or PurePosixPath(source) in root.parents
-            for source in self.sources
+    def validate_paths(self) -> "SandboxPathSymlink":
+        for field_name, value in (("source", self.source), ("destination", self.destination)):
+            path = PurePosixPath(value)
+            if (
+                not path.is_absolute()
+                or path == PurePosixPath("/")
+                or any(part in {"", ".", ".."} for part in path.parts)
+            ):
+                raise ValueError(
+                    "sandbox_path_symlinks."
+                    f"{field_name} must be an absolute non-root path without '.' or '..' components "
+                    f"(got {value!r})."
+                )
+        if PurePosixPath(self.source) == PurePosixPath(self.destination):
+            raise ValueError("sandbox_path_symlinks source and destination must differ.")
+        return self
+
+
+class SharedWorkspaceHostConfig(BaseModel, extra="forbid"):
+    """Physical host path for one direct shared workspace."""
+
+    path: str
+
+    @model_validator(mode="after")
+    def validate_path(self) -> "SharedWorkspaceHostConfig":
+        path = PurePosixPath(self.path)
+        if not path.is_absolute() or path == PurePosixPath("/") or any(part in {"", ".", ".."} for part in path.parts):
+            raise ValueError(
+                "shared_workspace.volume.host.path must be an absolute non-root path without "
+                f"'.' or '..' components (got {self.path!r})"
+            )
+        if path.name != "{context_id}":
+            raise ValueError("shared_workspace.volume.host.path must end with the {context_id} placeholder")
+        return self
+
+
+class SharedWorkspaceVolumeConfig(BaseModel):
+    """Provider volume mounted read-write for policy and read-only for verifier."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    name: str
+    host: SharedWorkspaceHostConfig
+    mount_path: str = Field(alias="mountPath")
+
+    @model_validator(mode="after")
+    def validate_volume(self) -> "SharedWorkspaceVolumeConfig":
+        if not self.name:
+            raise ValueError("shared_workspace.volume.name must not be empty")
+        mount_path = PurePosixPath(self.mount_path)
+        if (
+            not mount_path.is_absolute()
+            or mount_path == PurePosixPath("/")
+            or any(part in {"", ".", ".."} for part in mount_path.parts)
         ):
-            raise ValueError("shared_artifact_transfer.root and sources must not overlap")
-        if self.timeout_s <= 0:
-            raise ValueError("shared_artifact_transfer.timeout_s must be positive")
-        if self.stale_after_s <= 0:
-            raise ValueError("shared_artifact_transfer.stale_after_s must be positive")
+            raise ValueError(
+                "shared_workspace.volume.mountPath must be an absolute non-root path without "
+                f"'.' or '..' components (got {self.mount_path!r})"
+            )
+        self.mount_path = str(mount_path)
+        return self
+
+
+class SharedWorkspaceConfig(BaseModel, extra="forbid"):
+    """Direct EFS-backed policy workspace shared with a separate verifier."""
+
+    volume: SharedWorkspaceVolumeConfig
+    handoff_timeout_s: float = 600
+    cleanup_timeout_s: float = 600
+    cleanup_ttl_s: float = 900
+    cleanup_entrypoint: list[str] = Field(default_factory=lambda: ["tail", "-f", "/dev/null"])
+
+    @model_validator(mode="after")
+    def validate_timeouts(self) -> "SharedWorkspaceConfig":
+        for field_name in ("handoff_timeout_s", "cleanup_timeout_s", "cleanup_ttl_s"):
+            if getattr(self, field_name) <= 0:
+                raise ValueError(f"shared_workspace.{field_name} must be positive")
+        if not self.cleanup_entrypoint:
+            raise ValueError("shared_workspace.cleanup_entrypoint must not be empty")
         return self
 
 
 @dataclass(frozen=True)
-class SharedArtifactMarker:
-    """Host-side capability for one sandbox-local shared-filesystem snapshot."""
+class SharedWorkspaceMarker:
+    """Host-side capability authorizing one immutable shared workspace handoff."""
 
     context_id: str
     source: str
-    remote_path: str
+    host_path: str
+    exclude: tuple[str, ...]
     sha256: str
     source_environment_stopped: bool = False
     consumed: bool = False
@@ -147,10 +234,11 @@ class SharedArtifactMarker:
         return (
             json.dumps(
                 {
-                    "schema_version": _SHARED_ARTIFACT_SCHEMA_VERSION,
+                    "schema_version": _SHARED_WORKSPACE_SCHEMA_VERSION,
                     "context_id": self.context_id,
                     "source": self.source,
-                    "remote_path": self.remote_path,
+                    "host_path": self.host_path,
+                    "exclude": list(self.exclude),
                     "sha256": self.sha256,
                     "source_environment_stopped": self.source_environment_stopped,
                     "consumed": self.consumed,
@@ -162,33 +250,37 @@ class SharedArtifactMarker:
         )
 
     @classmethod
-    def from_path(cls, path: Path) -> "SharedArtifactMarker":
+    def from_path(cls, path: Path) -> "SharedWorkspaceMarker":
         raw = json.loads(path.read_text())
         expected = {
             "schema_version",
             "context_id",
             "source",
-            "remote_path",
+            "host_path",
+            "exclude",
             "sha256",
             "source_environment_stopped",
             "consumed",
         }
         if not isinstance(raw, dict) or set(raw) != expected:
-            raise ValueError(f"Invalid shared artifact marker fields in {path}")
-        if raw["schema_version"] != _SHARED_ARTIFACT_SCHEMA_VERSION:
-            raise ValueError(f"Unsupported shared artifact marker schema in {path}")
-        for field_name in ("context_id", "source", "remote_path", "sha256"):
+            raise ValueError(f"Invalid shared workspace marker fields in {path}")
+        if raw["schema_version"] != _SHARED_WORKSPACE_SCHEMA_VERSION:
+            raise ValueError(f"Unsupported shared workspace marker schema in {path}")
+        for field_name in ("context_id", "source", "host_path", "sha256"):
             if not isinstance(raw[field_name], str) or not raw[field_name]:
-                raise ValueError(f"Invalid {field_name} in shared artifact marker {path}")
+                raise ValueError(f"Invalid {field_name} in shared workspace marker {path}")
+        if not isinstance(raw["exclude"], list) or any(not isinstance(value, str) for value in raw["exclude"]):
+            raise ValueError(f"Invalid exclude in shared workspace marker {path}")
         if len(raw["sha256"]) != 64 or any(character not in "0123456789abcdef" for character in raw["sha256"]):
-            raise ValueError(f"Invalid sha256 in shared artifact marker {path}")
+            raise ValueError(f"Invalid sha256 in shared workspace marker {path}")
         for field_name in ("source_environment_stopped", "consumed"):
             if not isinstance(raw[field_name], bool):
-                raise ValueError(f"Invalid {field_name} in shared artifact marker {path}")
+                raise ValueError(f"Invalid {field_name} in shared workspace marker {path}")
         return cls(
             context_id=raw["context_id"],
             source=raw["source"],
-            remote_path=raw["remote_path"],
+            host_path=raw["host_path"],
+            exclude=tuple(raw["exclude"]),
             sha256=raw["sha256"],
             source_environment_stopped=raw["source_environment_stopped"],
             consumed=raw["consumed"],
@@ -226,12 +318,14 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
         sandbox_provider_options: ``SandboxSpec.provider_options`` passed through
             to the provider, e.g. ``resource_requests`` to schedule sandboxes
             below their resource limits. String values may contain
-            ``{environment_name}``, ``{task_id}``, or ``{session_id}``; these
-            are expanded per trial. This is useful for a volume ``sub_path``.
+            ``{context_id}``, ``{environment_name}``, ``{task_name}``,
+            ``{task_id}``, or ``{session_id}``; these are expanded per trial.
+            ``{task_name}`` is an alias for ``{environment_name}``.
         environment_upload_excludes: Relative paths omitted when Harbor uploads
             the task's ``environment/`` directory. Use this only when the image
             or a sandbox volume supplies those paths, e.g. ``["data"]`` with a
-            task-specific volume mounted at ``/app/data``.
+            task-specific volume mounted at ``/data`` and exposed through an
+            ``/app/data`` compatibility link.
         sandbox_path_copies: Ordered ``[{source: ..., destination: ...}]``
             directory copies performed inside the sandbox before Harbor uploads
             the task environment. Strings support the same per-trial placeholders
@@ -240,11 +334,17 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
             OpenSandbox API.
         sandbox_path_copy_timeout_s: Timeout for each sandbox-local directory
             copy (default 1200).
-        shared_artifact_transfer: Optional ``{root, sources, timeout_s}``
-            configuration for relaying selected artifact directories through a
-            sandbox-visible shared filesystem. The source environment snapshots
-            into an opaque per-trial directory; a separate verifier can consume
-            it only after source sandbox teardown succeeds.
+        sandbox_path_symlinks: Ordered ``[{source: ..., destination: ...}]``
+            compatibility links prepared after provider volumes are mounted and
+            before Harbor uploads the task environment. A separate verifier
+            validates links inside its read-only shared workspace instead of
+            modifying them. Strings support the same per-trial placeholders as
+            ``sandbox_provider_options``.
+        shared_workspace: Optional direct shared-workspace volume. Its physical
+            host path must end in ``{context_id}``. The policy receives the
+            volume read-write at ``volume.mountPath`` and the separate verifier
+            receives the same volume read-only. Harbor passes only a local
+            integrity marker between roles; policy artifacts are never copied.
         sandbox_env: Extra environment variables set in the sandbox.
         sandbox_ttl_s: Sandbox server-side TTL safety net (default 21600).
         sandbox_ready_timeout_s: Create/readiness timeout incl. image pull
@@ -289,7 +389,8 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
         environment_upload_excludes: Optional[Sequence[str]] = None,
         sandbox_path_copies: Optional[Sequence[Mapping[str, str]]] = None,
         sandbox_path_copy_timeout_s: Optional[float] = 1200,
-        shared_artifact_transfer: Optional[Mapping[str, Any] | SharedArtifactTransferConfig] = None,
+        sandbox_path_symlinks: Optional[Sequence[Mapping[str, str]]] = None,
+        shared_workspace: Optional[Mapping[str, Any] | SharedWorkspaceConfig] = None,
         sandbox_env: Optional[Mapping[str, str]] = None,
         sandbox_ttl_s: Optional[float] = 21600,
         sandbox_ready_timeout_s: Optional[float] = 900,
@@ -311,15 +412,19 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
         self._environment_upload_excludes = self._validate_upload_excludes(environment_upload_excludes or ())
         self._sandbox_path_copies = tuple(SandboxPathCopy.model_validate(item) for item in (sandbox_path_copies or ()))
         self._sandbox_path_copy_timeout_s = sandbox_path_copy_timeout_s
-        self._shared_artifact_transfer = (
-            shared_artifact_transfer
-            if isinstance(shared_artifact_transfer, SharedArtifactTransferConfig)
-            else SharedArtifactTransferConfig.model_validate(shared_artifact_transfer)
-            if shared_artifact_transfer is not None
+        self._sandbox_path_symlinks = tuple(
+            SandboxPathSymlink.model_validate(item) for item in (sandbox_path_symlinks or ())
+        )
+        validate_sandbox_template_placeholders(shared_workspace, context="shared_workspace")
+        self._shared_workspace = (
+            shared_workspace
+            if isinstance(shared_workspace, SharedWorkspaceConfig)
+            else SharedWorkspaceConfig.model_validate(shared_workspace)
+            if shared_workspace is not None
             else None
         )
-        self._shared_transfer_markers: set[Path] = set()
-        self._shared_transfer_cleanup_paths: set[PurePosixPath] = set()
+        self._shared_workspace_markers: set[Path] = set()
+        self._shared_workspace_cleanup_required = False
         self._sandbox_env = {str(k): str(v) for k, v in dict(sandbox_env or {}).items()}
         self._sandbox_ttl_s = sandbox_ttl_s
         self._sandbox_ready_timeout_s = sandbox_ready_timeout_s
@@ -387,23 +492,31 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
         return tuple(normalized)
 
     def _render_provider_option_templates(self, value: Any) -> Any:
-        if isinstance(value, str):
-            task_id = self.environment_name.rsplit("__", 1)[-1]
-            replacements = {
-                "{environment_name}": self.environment_name,
-                "{task_id}": task_id,
-                "{session_id}": self.session_id,
-            }
-            for placeholder, replacement in replacements.items():
-                value = value.replace(placeholder, replacement)
-            return value
-        if isinstance(value, Mapping):
-            return {key: self._render_provider_option_templates(item) for key, item in value.items()}
-        if isinstance(value, list):
-            return [self._render_provider_option_templates(item) for item in value]
-        if isinstance(value, tuple):
-            return tuple(self._render_provider_option_templates(item) for item in value)
-        return value
+        validate_sandbox_template_placeholders(value, context="sandbox provider options")
+        task_id = self.environment_name.rsplit("__", 1)[-1]
+        replacements = {
+            "context_id": str(self.context_id),
+            "environment_name": self.environment_name,
+            "task_name": self.environment_name,
+            "task_id": task_id,
+            "session_id": self.session_id,
+        }
+
+        def render(item: Any) -> Any:
+            if isinstance(item, str):
+                return _SANDBOX_TEMPLATE_PATTERN.sub(
+                    lambda match: replacements[match.group("name")],
+                    item,
+                )
+            if isinstance(item, Mapping):
+                return {render(key): render(nested) for key, nested in item.items()}
+            if isinstance(item, list):
+                return [render(nested) for nested in item]
+            if isinstance(item, tuple):
+                return tuple(render(nested) for nested in item)
+            return item
+
+        return render(value)
 
     def _is_environment_upload(self, source: Path) -> bool:
         return source.resolve() == Path(self.environment_dir).resolve()
@@ -418,6 +531,41 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
         return any(
             relative == excluded or excluded in relative.parents for excluded in self._environment_upload_excludes
         )
+
+    def _shared_workspace_volume(self, *, read_only: bool) -> dict[str, Any]:
+        config = self._shared_workspace
+        if config is None:
+            raise RuntimeError("Shared workspace is not configured")
+        volume = self._render_provider_option_templates(config.volume.model_dump(by_alias=True))
+        volume["readOnly"] = read_only
+        return volume
+
+    def _provider_options_for_role(self) -> dict[str, Any]:
+        rendered = self._render_provider_option_templates(self._sandbox_provider_options)
+        if not isinstance(rendered, Mapping):
+            raise ValueError("sandbox_provider_options must be a mapping")
+        options = dict(rendered)
+        if self._shared_workspace is None:
+            return options
+
+        configured_volumes = options.get("volumes", [])
+        if not isinstance(configured_volumes, list):
+            raise ValueError("sandbox_provider_options.volumes must be a list")
+        shared_volume = self._shared_workspace_volume(read_only=self._is_separate_verifier)
+        shared_name = shared_volume["name"]
+        shared_mount = shared_volume["mountPath"]
+        for volume in configured_volumes:
+            if not isinstance(volume, Mapping):
+                raise ValueError("sandbox_provider_options.volumes entries must be mappings")
+            mount_path = volume.get("mountPath", volume.get("mount_path"))
+            if volume.get("name") == shared_name:
+                raise ValueError(f"sandbox_provider_options.volumes duplicates shared workspace name {shared_name!r}")
+            if mount_path == shared_mount:
+                raise ValueError(
+                    f"sandbox_provider_options.volumes duplicates shared workspace mount {shared_mount!r}"
+                )
+        options["volumes"] = [shared_volume, *configured_volumes]
+        return options
 
     def _build_spec(self) -> SandboxSpec:
         config = self.task_env_config
@@ -448,7 +596,7 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
             metadata=metadata,
             resources=resources,
             entrypoint=self._entrypoint,
-            provider_options=self._render_provider_option_templates(self._sandbox_provider_options),
+            provider_options=self._provider_options_for_role(),
         )
 
     async def _upload_environment_dir_after_start(self) -> None:
@@ -487,235 +635,344 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
                     f"Failed to copy sandbox directory {rendered.source!r} to {rendered.destination!r}: {output}"
                 )
 
-    def _uses_shared_artifact_transfer(self, source_dir: str) -> bool:
-        config = self._shared_artifact_transfer
-        return config is not None and str(PurePosixPath(source_dir)) in config.sources
+    def _rendered_sandbox_path_symlinks(self) -> tuple[SandboxPathSymlink, ...]:
+        return tuple(
+            SandboxPathSymlink.model_validate(
+                self._render_provider_option_templates(configured_symlink.model_dump())
+            )
+            for configured_symlink in self._sandbox_path_symlinks
+        )
+
+    def _verifier_must_validate_symlink(self, destination: PurePosixPath) -> bool:
+        if not self._is_separate_verifier or self._shared_workspace is None:
+            return False
+        shared_mount = PurePosixPath(self._shared_workspace.volume.mount_path)
+        return destination == shared_mount or shared_mount in destination.parents
 
     @staticmethod
-    def _write_shared_artifact_marker(path: Path, marker: SharedArtifactMarker) -> None:
+    def _sandbox_path_symlink_validation_command(config: SandboxPathSymlink) -> str:
+        source = shlex.quote(config.source)
+        destination = shlex.quote(config.destination)
+        return (
+            f"test -e {source} && test -L {destination} && "
+            f"[ \"$(readlink -f -- {destination})\" = \"$(readlink -f -- {source})\" ]"
+        )
+
+    async def _prepare_sandbox_path_symlinks(self) -> None:
+        sandbox = self._require_sandbox()
+        for rendered in self._rendered_sandbox_path_symlinks():
+            destination_path = PurePosixPath(rendered.destination)
+            validation = self._sandbox_path_symlink_validation_command(rendered)
+            if self._verifier_must_validate_symlink(destination_path):
+                command = validation
+                action = "validate"
+            else:
+                parent = shlex.quote(str(destination_path.parent))
+                destination = shlex.quote(rendered.destination)
+                source = shlex.quote(rendered.source)
+                command = (
+                    f"test -e {source} && mkdir -p {parent} && "
+                    f"if [ -L {destination} ]; then {validation}; "
+                    f"elif [ -e {destination} ]; then exit 74; "
+                    f"else ln -s -- {source} {destination}; fi"
+                )
+                action = "prepare"
+            result = await sandbox.exec(command, cwd="/", timeout_s=60, user="root")
+            if result.return_code != 0:
+                output = result.stderr or result.stdout or "<no output>"
+                self.logger.error(
+                    "Failed to %s sandbox symlink %r -> %r: %s",
+                    action,
+                    rendered.destination,
+                    rendered.source,
+                    output,
+                )
+                raise RuntimeError(
+                    f"Failed to {action} sandbox symlink {rendered.destination!r} -> {rendered.source!r}: {output}"
+                )
+
+    def _uses_shared_workspace(self, source_dir: str) -> bool:
+        config = self._shared_workspace
+        return config is not None and str(PurePosixPath(source_dir)) == config.volume.mount_path
+
+    @staticmethod
+    def _write_shared_workspace_marker(path: Path, marker: SharedWorkspaceMarker) -> None:
         temporary = path.with_name(f"{path.name}.tmp")
         temporary.write_text(marker.to_json())
         temporary.replace(path)
 
-    def _validate_shared_remote_path(self, marker: SharedArtifactMarker) -> PurePosixPath:
-        config = self._shared_artifact_transfer
-        if config is None:
-            raise RuntimeError("Shared artifact marker found but shared_artifact_transfer is disabled")
-        if marker.context_id != str(self.context_id):
-            raise RuntimeError("Shared artifact marker belongs to a different Harbor trial")
-        if marker.source not in config.sources:
-            raise RuntimeError("Shared artifact marker source is not enabled in this environment")
-        expected_parent = PurePosixPath(config.root) / "v1" / marker.context_id
-        remote_path = PurePosixPath(marker.remote_path)
-        if remote_path.parent != expected_parent:
-            raise RuntimeError("Shared artifact marker path is outside its opaque per-trial namespace")
-        return remote_path
+    def _shared_workspace_host_path(self) -> PurePosixPath:
+        volume = self._shared_workspace_volume(read_only=self._is_separate_verifier)
+        host = volume.get("host")
+        if not isinstance(host, Mapping) or not isinstance(host.get("path"), str):
+            raise ValueError("shared_workspace.volume.host.path must be a string")
+        path = PurePosixPath(host["path"])
+        if path.name != str(self.context_id):
+            raise ValueError("Rendered shared workspace host path must end with the Harbor context ID")
+        return path
 
-    async def _snapshot_dir_to_shared_transfer(
+    @staticmethod
+    def _validate_shared_workspace_excludes(exclude: Sequence[str]) -> tuple[str, ...]:
+        normalized: list[str] = []
+        for value in exclude:
+            path = PurePosixPath(value)
+            if (
+                path.is_absolute()
+                or not path.parts
+                or any(part in {"", ".", ".."} for part in path.parts)
+                or any(character in value for character in "*?[")
+            ):
+                raise ValueError(
+                    "Direct shared workspace exclusions must be literal relative paths without "
+                    f"'.', '..', or glob components (got {value!r})"
+                )
+            normalized.append(str(path))
+        return tuple(normalized)
+
+    def _shared_workspace_digest_command(
+        self,
+        *,
+        source_dir: str,
+        exclude: Sequence[str],
+        prune_excluded: bool,
+    ) -> str:
+        source = PurePosixPath(source_dir)
+        mounts = set(self._sandbox_volume_mount_paths())
+        commands = ["set -euo pipefail"]
+        if prune_excluded:
+            symlink_sources = {
+                PurePosixPath(config.destination): config
+                for config in self._rendered_sandbox_path_symlinks()
+            }
+            for relative in exclude:
+                excluded = source / relative
+                if excluded in mounts:
+                    continue
+                configured_symlink = symlink_sources.get(excluded)
+                if configured_symlink is not None:
+                    commands.append(self._sandbox_path_symlink_validation_command(configured_symlink))
+                    continue
+                if any(excluded in mount.parents or mount in excluded.parents for mount in mounts if mount != source):
+                    raise ValueError(f"Cannot safely exclude {relative!r} because it overlaps a nested volume")
+                commands.append(f"rm -rf -- {shlex.quote(str(excluded))}")
+        quoted_source = shlex.quote(str(source))
+        commands.extend(
+            [
+                f"bad=$(find {quoted_source} -xdev -mindepth 1 ! -type d ! -type f ! -type l -print -quit)",
+                'if [ -n "$bad" ]; then printf \'unsupported workspace entry: %s\\n\' "$bad"; exit 73; fi',
+            ]
+        )
+        exclude_flags = " ".join(
+            f"--exclude={shlex.quote(relative)} --exclude={shlex.quote(f'./{relative}')}" for relative in exclude
+        )
+        commands.append(
+            "tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner --format=gnu "
+            f"{exclude_flags} -C {quoted_source} -cf - . | sha256sum | awk '{{print $1}}'"
+        )
+        return f"bash -o pipefail -c {shlex.quote('; '.join(commands))}"
+
+    @staticmethod
+    def _shared_workspace_error_output(result: Any) -> str:
+        return (
+            "\n".join(
+                output
+                for output in (
+                    (result.stdout or "").strip(),
+                    (result.stderr or "").strip(),
+                )
+                if output
+            )
+            or "<no output>"
+        )
+
+    async def _shared_workspace_digest(
+        self,
+        *,
+        source_dir: str,
+        exclude: Sequence[str],
+        prune_excluded: bool,
+    ) -> str:
+        config = self._shared_workspace
+        if config is None:
+            raise RuntimeError("Shared workspace is not configured")
+        result = await self._require_sandbox().exec(
+            self._shared_workspace_digest_command(
+                source_dir=source_dir,
+                exclude=exclude,
+                prune_excluded=prune_excluded,
+            ),
+            cwd="/",
+            timeout_s=config.handoff_timeout_s,
+            user="root",
+        )
+        if result.return_code != 0:
+            raise RuntimeError(
+                f"Failed to validate shared workspace {source_dir!r}: {self._shared_workspace_error_output(result)}"
+            )
+        digest = (result.stdout or "").strip().splitlines()[-1:]
+        if not digest or len(digest[0]) != 64 or any(character not in "0123456789abcdef" for character in digest[0]):
+            raise RuntimeError("Shared workspace validation did not return a valid SHA-256 digest")
+        return digest[0]
+
+    async def _mark_shared_workspace(
         self,
         *,
         source_dir: str,
         target_dir: Path,
         exclude: Sequence[str],
     ) -> None:
-        config = self._shared_artifact_transfer
-        if config is None:
-            raise RuntimeError("Shared artifact transfer is not configured")
+        if self._is_separate_verifier:
+            raise RuntimeError("Only a policy environment may produce a shared workspace marker")
         target_dir.mkdir(parents=True, exist_ok=True)
         if any(target_dir.iterdir()):
-            raise RuntimeError(f"Shared artifact marker directory is not empty: {target_dir}")
-
-        context_id = str(self.context_id)
-        transfer_id = uuid.uuid4().hex
-        root = PurePosixPath(config.root)
-        version_dir = root / "v1"
-        context_dir = version_dir / context_id
-        remote_path = context_dir / transfer_id
-        staging_path = context_dir / f".staging-{transfer_id}"
-        payload_path = staging_path / "payload"
-        archive_path = staging_path / "workspace.tar"
-        exclude_flags = " ".join(f"--exclude={shlex.quote(pattern)}" for pattern in exclude)
-        stale_after_minutes = max(1, int(config.stale_after_s // 60))
-        script = (
-            "set -euo pipefail; umask 077; "
-            f"test -d {shlex.quote(source_dir)}; "
-            f"test ! -L {shlex.quote(str(root))}; mkdir -p {shlex.quote(str(root))}; "
-            f"test ! -L {shlex.quote(str(version_dir))}; mkdir -p {shlex.quote(str(version_dir))}; "
-            f"find {shlex.quote(str(version_dir))} -mindepth 1 -maxdepth 1 -type d "
-            f"-mmin +{stale_after_minutes} -exec rm -rf -- {{}} +; "
-            f"test ! -L {shlex.quote(str(context_dir))}; mkdir -p {shlex.quote(str(context_dir))}; "
-            f"test ! -e {shlex.quote(str(remote_path))}; rm -rf {shlex.quote(str(staging_path))}; "
-            f"trap 'rm -rf {shlex.quote(str(staging_path))}' EXIT; "
-            f"mkdir -p {shlex.quote(str(payload_path))}; "
-            f"tar {exclude_flags} -C {shlex.quote(source_dir)} -cf - . "
-            f"| tar -C {shlex.quote(str(payload_path))} -xf -; "
-            f"bad=$(find {shlex.quote(str(payload_path))} ! -type d ! -type f -print -quit); "
-            'if [ -n "$bad" ]; then printf \'unsupported artifact entry: %s\\n\' "$bad"; exit 73; fi; '
-            f"tar -C {shlex.quote(str(payload_path))} -cf {shlex.quote(str(archive_path))} .; "
-            f"rm -rf {shlex.quote(str(payload_path))}; "
-            f": > {shlex.quote(str(staging_path / 'ready'))}; "
-            f"mv {shlex.quote(str(staging_path))} {shlex.quote(str(remote_path))}; trap - EXIT; "
-            f"sha256sum {shlex.quote(str(remote_path / 'workspace.tar'))} | awk '{{print $1}}'"
+            raise RuntimeError(f"Shared workspace marker directory is not empty: {target_dir}")
+        normalized_exclude = self._validate_shared_workspace_excludes(exclude)
+        digest = await self._shared_workspace_digest(
+            source_dir=source_dir,
+            exclude=normalized_exclude,
+            prune_excluded=True,
         )
-        result = await self._require_sandbox().exec(
-            f"bash -o pipefail -c {shlex.quote(script)}",
-            cwd="/",
-            timeout_s=config.timeout_s,
-            user="root",
-        )
-        if result.return_code != 0:
-            output = (
-                "\n".join(
-                    output
-                    for output in (
-                        (result.stdout or "").strip(),
-                        (result.stderr or "").strip(),
-                    )
-                    if output
-                )
-                or "<no output>"
-            )
-            raise RuntimeError(f"Failed to snapshot {source_dir!r} into shared artifact storage: {output}")
-        digest = (result.stdout or "").strip().splitlines()[-1:]
-        if not digest or len(digest[0]) != 64 or any(character not in "0123456789abcdef" for character in digest[0]):
-            await self._require_sandbox().exec(
-                f"rm -rf {shlex.quote(str(remote_path))}",
-                cwd="/",
-                timeout_s=60,
-                user="root",
-            )
-            raise RuntimeError("Shared artifact snapshot did not return a valid SHA-256 digest")
-
-        marker_path = target_dir / _SHARED_ARTIFACT_MARKER
-        marker = SharedArtifactMarker(
-            context_id=context_id,
+        marker_path = target_dir / _SHARED_WORKSPACE_MARKER
+        marker = SharedWorkspaceMarker(
+            context_id=str(self.context_id),
             source=str(PurePosixPath(source_dir)),
-            remote_path=str(remote_path),
-            sha256=digest[0],
+            host_path=str(self._shared_workspace_host_path()),
+            exclude=normalized_exclude,
+            sha256=digest,
         )
-        try:
-            self._write_shared_artifact_marker(marker_path, marker)
-        except OSError:
-            await self._require_sandbox().exec(
-                f"rm -rf {shlex.quote(str(remote_path))}",
-                cwd="/",
-                timeout_s=60,
-                user="root",
-            )
-            raise
-        self._shared_transfer_markers.add(marker_path)
+        self._write_shared_workspace_marker(marker_path, marker)
+        self._shared_workspace_markers.add(marker_path)
 
-    async def _upload_shared_artifact(self, source: Path, target_dir: str) -> bool:
-        marker_path = source / _SHARED_ARTIFACT_MARKER
+    def _validate_shared_workspace_marker(self, marker: SharedWorkspaceMarker, target_dir: str) -> None:
+        config = self._shared_workspace
+        if config is None:
+            raise RuntimeError("Shared workspace marker found but shared_workspace is disabled")
+        if marker.context_id != str(self.context_id):
+            raise RuntimeError("Shared workspace marker belongs to a different Harbor trial")
+        if marker.source != config.volume.mount_path or str(PurePosixPath(target_dir)) != marker.source:
+            raise RuntimeError("Shared workspace handoff target does not match its original source")
+        if marker.host_path != str(self._shared_workspace_host_path()):
+            raise RuntimeError("Shared workspace marker points to a different physical source path")
+        if not marker.source_environment_stopped:
+            raise RuntimeError("Refusing shared workspace handoff before source sandbox teardown is confirmed")
+        if not self._is_separate_verifier:
+            raise RuntimeError("Shared workspace handoff may only be consumed by a separate verifier environment")
+        if marker.consumed:
+            raise RuntimeError("Shared workspace handoff has already been consumed")
+
+    async def _accept_shared_workspace(self, source: Path, target_dir: str) -> bool:
+        marker_path = source / _SHARED_WORKSPACE_MARKER
         if not marker_path.is_file():
             return False
-        if {path.name for path in source.iterdir()} != {_SHARED_ARTIFACT_MARKER}:
-            raise RuntimeError(f"Shared artifact marker directory contains unexpected entries: {source}")
-
-        marker = SharedArtifactMarker.from_path(marker_path)
-        remote_path = self._validate_shared_remote_path(marker)
-        if str(PurePosixPath(target_dir)) != marker.source:
-            raise RuntimeError("Shared artifact handoff target does not match its original source")
-        if not marker.source_environment_stopped:
-            raise RuntimeError("Refusing shared artifact handoff before source sandbox teardown is confirmed")
-        if not self._is_separate_verifier:
-            raise RuntimeError("Shared artifact handoff may only be consumed by a separate verifier environment")
-        if marker.consumed:
-            raise RuntimeError("Shared artifact handoff has already been consumed")
-
-        config = self._shared_artifact_transfer
-        if config is None:
-            raise RuntimeError("Shared artifact transfer is not configured")
-        archive = remote_path / "workspace.tar"
-        ready = remote_path / "ready"
-        restore_path = PurePosixPath(_TRANSFER_DIR) / f".nemo-gym-shared-restore-{uuid.uuid4().hex}"
-        # The verifier owns the relay after accepting its host-side capability.
-        # Keep it until stop() so failed judging/setup paths cannot leak EFS state.
-        self._shared_transfer_cleanup_paths.add(remote_path)
-        script = (
-            "set -euo pipefail; "
-            f"test -f {shlex.quote(str(ready))}; test -f {shlex.quote(str(archive))}; "
-            f"actual=$(sha256sum {shlex.quote(str(archive))} | awk '{{print $1}}'); "
-            f'test "$actual" = {shlex.quote(marker.sha256)}; '
-            f"rm -rf {shlex.quote(str(restore_path))}; trap 'rm -rf {shlex.quote(str(restore_path))}' EXIT; "
-            f"mkdir -p {shlex.quote(str(restore_path))}; tar -C {shlex.quote(str(restore_path))} "
-            f"-xf {shlex.quote(str(archive))}; "
-            f"bad=$(find {shlex.quote(str(restore_path))} ! -type d ! -type f -print -quit); "
-            'if [ -n "$bad" ]; then printf \'unsupported artifact entry: %s\\n\' "$bad"; exit 73; fi; '
-            f"mkdir -p {shlex.quote(target_dir)}; "
-            f"cp -a -- {shlex.quote(str(restore_path))}/. {shlex.quote(target_dir)}/; "
-            f"rm -rf {shlex.quote(str(restore_path))}; trap - EXIT"
+        if {path.name for path in source.iterdir()} != {_SHARED_WORKSPACE_MARKER}:
+            raise RuntimeError(f"Shared workspace marker directory contains unexpected entries: {source}")
+        marker = SharedWorkspaceMarker.from_path(marker_path)
+        self._validate_shared_workspace_marker(marker, target_dir)
+        self._shared_workspace_cleanup_required = True
+        actual_digest = await self._shared_workspace_digest(
+            source_dir=target_dir,
+            exclude=marker.exclude,
+            prune_excluded=False,
         )
-        result = await self._require_sandbox().exec(
-            f"bash -o pipefail -c {shlex.quote(script)}",
-            cwd="/",
-            timeout_s=config.timeout_s,
-            user="root",
-        )
-        if result.return_code != 0:
-            output = (
-                "\n".join(
-                    output
-                    for output in (
-                        (result.stdout or "").strip(),
-                        (result.stderr or "").strip(),
-                    )
-                    if output
-                )
-                or "<no output>"
+        if actual_digest != marker.sha256:
+            self.logger.error(
+                "Shared workspace digest mismatch for %r: expected %s, got %s",
+                target_dir,
+                marker.sha256,
+                actual_digest,
             )
-            raise RuntimeError(f"Failed to restore shared artifacts into {target_dir!r}: {output}")
-        self._write_shared_artifact_marker(marker_path, replace(marker, consumed=True))
+            raise RuntimeError(
+                "Shared workspace changed between policy teardown and verifier mount: "
+                f"expected {marker.sha256}, got {actual_digest}"
+            )
+        self._write_shared_workspace_marker(marker_path, replace(marker, consumed=True))
         return True
 
-    async def _cleanup_shared_artifact_transfers(self) -> None:
-        """Delete verifier-owned relay paths before its EFS volume is detached."""
-        if not self._shared_transfer_cleanup_paths:
-            return
-        config = self._shared_artifact_transfer
+    async def _cleanup_shared_workspace(self) -> None:
+        config = self._shared_workspace
         if config is None:
-            raise RuntimeError("Shared artifact cleanup is pending but transfer is disabled")
+            return
+        host_path = self._shared_workspace_host_path()
+        context_id = str(self.context_id)
+        if host_path.name != context_id:
+            raise RuntimeError("Refusing cleanup outside the context-scoped shared workspace")
 
-        commands: list[str] = ["set -euo pipefail"]
-        for remote_path in sorted(self._shared_transfer_cleanup_paths, key=str):
-            context_dir = remote_path.parent
-            commands.extend(
-                [
-                    f"rm -rf -- {shlex.quote(str(remote_path))}",
-                    f"rmdir {shlex.quote(str(context_dir))} 2>/dev/null || true",
-                ]
-            )
-        result = await self._require_sandbox().exec(
-            f"bash -o pipefail -c {shlex.quote('; '.join(commands))}",
-            cwd="/",
-            timeout_s=config.timeout_s,
-            user="root",
+        rendered_options = self._render_provider_option_templates(self._sandbox_provider_options)
+        if not isinstance(rendered_options, Mapping):
+            raise ValueError("sandbox_provider_options must be a mapping")
+        cleanup_options = {key: value for key, value in rendered_options.items() if key != "volumes"}
+        cleanup_options["volumes"] = [
+            {
+                "name": f"{config.volume.name}-cleanup",
+                "host": {"path": str(host_path.parent)},
+                "mountPath": _SHARED_WORKSPACE_CLEANUP_MOUNT,
+                "readOnly": False,
+            }
+        ]
+        cleanup_spec = SandboxSpec(
+            image=self._resolved_image,
+            ttl_s=config.cleanup_ttl_s,
+            ready_timeout_s=min(float(self._sandbox_ready_timeout_s or config.cleanup_ttl_s), config.cleanup_ttl_s),
+            workdir="/",
+            env={},
+            metadata={
+                "harbor-session": self.session_id,
+                "harbor-task": self.environment_name,
+                "harbor-role": "workspace-cleanup",
+                **resolve_provider_metadata(self._sandbox_provider),
+                **self._sandbox_metadata,
+            },
+            resources={},
+            entrypoint=config.cleanup_entrypoint,
+            provider_options=cleanup_options,
         )
-        if result.return_code != 0:
-            output = (
-                "\n".join(
-                    output
-                    for output in (
-                        (result.stdout or "").strip(),
-                        (result.stderr or "").strip(),
-                    )
-                    if output
-                )
-                or "<no output>"
+        cleanup_sandbox = AsyncSandbox(resolve_provider_config(self._sandbox_provider), cleanup_spec)
+        cleanup_started = False
+        operation_error: Exception | None = None
+        try:
+            await cleanup_sandbox.start()
+            cleanup_started = True
+            target = PurePosixPath(_SHARED_WORKSPACE_CLEANUP_MOUNT) / context_id
+            result = await cleanup_sandbox.exec(
+                f"rm -rf -- {shlex.quote(str(target))}; test ! -e {shlex.quote(str(target))}",
+                cwd="/",
+                timeout_s=config.cleanup_timeout_s,
+                user="root",
             )
-            raise RuntimeError(f"Failed to clean shared artifact relay during verifier teardown: {output}")
-        self._shared_transfer_cleanup_paths.clear()
+            if result.return_code != 0:
+                raise RuntimeError(
+                    f"Failed to clean direct shared workspace: {self._shared_workspace_error_output(result)}"
+                )
+        except Exception as error:  # noqa: BLE001 - cleanup sandbox must still terminate
+            operation_error = error
 
-    def _confirm_shared_artifact_source_stopped(self) -> None:
-        for marker_path in self._shared_transfer_markers:
-            marker = SharedArtifactMarker.from_path(marker_path)
-            self._write_shared_artifact_marker(
+        stop_error: Exception | None = None
+        if cleanup_started:
+            try:
+                await cleanup_sandbox.stop()
+            except Exception as error:  # noqa: BLE001 - report both cleanup operation and termination failures
+                stop_error = error
+        if operation_error is not None:
+            if stop_error is not None:
+                raise RuntimeError(
+                    "Shared workspace cleanup and cleanup-sandbox termination both failed: "
+                    f"cleanup_error={operation_error!r}, stop_error={stop_error!r}"
+                ) from operation_error
+            raise operation_error
+        if stop_error is not None:
+            raise stop_error
+        self._shared_workspace_cleanup_required = False
+
+    def _confirm_shared_workspace_source_stopped(self) -> None:
+        for marker_path in self._shared_workspace_markers:
+            marker = SharedWorkspaceMarker.from_path(marker_path)
+            self._write_shared_workspace_marker(
                 marker_path,
                 replace(marker, source_environment_stopped=True),
             )
 
     def _sandbox_volume_mount_paths(self) -> tuple[PurePosixPath, ...]:
-        rendered = self._render_provider_option_templates(self._sandbox_provider_options)
+        rendered = self._provider_options_for_role()
         volumes = rendered.get("volumes", []) if isinstance(rendered, Mapping) else []
         mount_paths: list[PurePosixPath] = []
         for volume in volumes:
@@ -781,6 +1038,7 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
             raise RuntimeError(
                 f"Failed to create log directories in sandbox: {result.stderr or result.stdout or '<no output>'}"
             )
+        await self._prepare_sandbox_path_symlinks()
         await self._copy_sandbox_paths()
         await self._upload_environment_dir_after_start()
 
@@ -794,6 +1052,15 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
             if any(path == destination or path in destination.parents for path in emptied):
                 return True
         return False
+
+    def _emptying_removes_sandbox_symlink(self, dirs: Sequence[str | PurePath]) -> bool:
+        emptied = [PurePosixPath(str(path)) for path in dirs]
+        return any(
+            any(path == destination or path in destination.parents for path in emptied)
+            for destination in (
+                PurePosixPath(config.destination) for config in self._rendered_sandbox_path_symlinks()
+            )
+        )
 
     async def ensure_dirs(
         self,
@@ -824,8 +1091,11 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
             cwd="/",
             user=self._reset_dirs_user(),
         )
-        if result.return_code == 0 and self._is_separate_verifier and self._emptying_removes_sandbox_copy(dirs):
-            await self._copy_sandbox_paths()
+        if result.return_code == 0:
+            if self._emptying_removes_sandbox_symlink(dirs):
+                await self._prepare_sandbox_path_symlinks()
+            if self._is_separate_verifier and self._emptying_removes_sandbox_copy(dirs):
+                await self._copy_sandbox_paths()
         return result
 
     async def is_dir(self, path: str, user: str | int | None = None) -> bool:
@@ -861,13 +1131,6 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
                 "delete=False is ignored by NemoGymSandboxEnvironment; the sandbox is always terminated on stop()."
             )
         sandbox = self._sandbox
-        cleanup_error: Exception | None = None
-        if self._is_separate_verifier:
-            try:
-                await self._cleanup_shared_artifact_transfers()
-            except Exception as error:  # noqa: BLE001 - sandbox termination must still run
-                cleanup_error = error
-                self.logger.exception("Failed to clean verifier shared artifact relay before sandbox termination")
         stop_error: Exception | None = None
         try:
             await sandbox.stop()
@@ -876,16 +1139,16 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
         finally:
             self._sandbox = None
         if stop_error is None:
-            self._confirm_shared_artifact_source_stopped()
-        if cleanup_error is not None:
-            if stop_error is not None:
-                raise RuntimeError(
-                    "Failed to clean shared artifact relay and terminate verifier sandbox: "
-                    f"cleanup_error={cleanup_error!r}, stop_error={stop_error!r}"
-                ) from cleanup_error
-            raise cleanup_error
+            self._confirm_shared_workspace_source_stopped()
         if stop_error is not None:
             raise stop_error
+        should_cleanup = self._shared_workspace_cleanup_required or (
+            self._shared_workspace is not None
+            and not self._is_separate_verifier
+            and not self._shared_workspace_markers
+        )
+        if should_cleanup:
+            await self._cleanup_shared_workspace()
 
     async def exec(
         self,
@@ -931,7 +1194,7 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
         source = Path(source_dir)
         if not source.exists():
             raise FileNotFoundError(f"Source directory not found: {source}")
-        if await self._upload_shared_artifact(source, target_dir):
+        if await self._accept_shared_workspace(source, target_dir):
             return
         sandbox = self._require_sandbox()
         excludes = self._environment_upload_excludes if self._is_environment_upload(source) else ()
@@ -992,8 +1255,8 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
         await self._require_sandbox().download(source_path, target)
 
     async def download_dir(self, source_dir: str, target_dir: Path | str):
-        if self._uses_shared_artifact_transfer(source_dir):
-            await self._snapshot_dir_to_shared_transfer(
+        if self._uses_shared_workspace(source_dir):
+            await self._mark_shared_workspace(
                 source_dir=source_dir,
                 target_dir=Path(target_dir),
                 exclude=(),
@@ -1013,8 +1276,8 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
         target_dir: Path | str,
         exclude: list[str],
     ) -> None:
-        if self._uses_shared_artifact_transfer(source_dir):
-            await self._snapshot_dir_to_shared_transfer(
+        if self._uses_shared_workspace(source_dir):
+            await self._mark_shared_workspace(
                 source_dir=source_dir,
                 target_dir=Path(target_dir),
                 exclude=exclude,

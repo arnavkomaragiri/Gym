@@ -37,7 +37,16 @@ from pydantic import BaseModel, ConfigDict, model_validator
 
 # The fields the model server attaches to a served response when token-id return
 # is on. ``routed_experts`` is present only for MoE backends that report it.
-TOKEN_FIELDS = ("prompt_token_ids", "generation_token_ids", "generation_log_probs", "routed_experts")
+TOKEN_FIELDS = (
+    "prompt_token_ids",
+    "generation_token_ids",
+    "generation_log_probs",
+    "routed_experts",
+    "ng_generation_replica_id",
+    "ng_generation_weight_version",
+    "ng_kv_cache_scheduler_block_size",
+    "ng_kv_cache_hash_block_size",
+)
 
 # Bumped whenever a field is added or its meaning changes. Writer and reader are different
 # processes and may be different repositories, and records outlive a deploy, so a reader has to
@@ -46,7 +55,8 @@ TOKEN_FIELDS = ("prompt_token_ids", "generation_token_ids", "generation_log_prob
 # first version because a check added later cannot tell an old record from an unversioned one.
 #
 #   1  rollout and call identity, the token arrays, the output items and their carrier index
-TOKEN_ENTRY_RECORD_SCHEMA_VERSION = 1
+#   2  generation replica/version and runtime KV-cache block metadata
+TOKEN_ENTRY_RECORD_SCHEMA_VERSION = 2
 
 
 class TokenEntry(BaseModel):
@@ -76,6 +86,10 @@ class TokenEntry(BaseModel):
     generation_token_ids: list[int]
     generation_log_probs: list[float]
     routed_experts: Any | None = None
+    ng_generation_replica_id: str | None = None
+    ng_generation_weight_version: int | None = None
+    ng_kv_cache_scheduler_block_size: int | None = None
+    ng_kv_cache_hash_block_size: int | None = None
     # The served response's output items (Responses shape), content preserved, token
     # arrays removed.
     output_items: list[dict] = []

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 from pathlib import Path
@@ -17,10 +18,13 @@ from responses_api_agents.gym_harbor_agent.agentic_verifier import (
     AgenticVerifier,
     AgenticVerifierConfig,
     _validate_score_trajectory,
+    _WorkingDirectoryEnvironment,
 )
 
 
 class FakeJudge:
+    SUPPORTS_RESUME = False
+
     def __init__(self, reward_path: Path, logs_dir: Path, config) -> None:
         self.reward_path = reward_path
         self.logs_dir = logs_dir
@@ -66,6 +70,37 @@ class FakeJudge:
 
     def populate_context_post_run(self, context: AgentContext) -> None:
         context.metadata = {"judge": "complete"}
+
+
+class FailingAfterScoreJudge(FakeJudge):
+    async def run(self, instruction: str, environment, context: AgentContext) -> None:
+        await super().run(instruction, environment, context)
+        raise TimeoutError("judge wrapper timed out during shutdown")
+
+
+class FailingBeforeScoreJudge(FakeJudge):
+    async def run(self, instruction: str, environment, context: AgentContext) -> None:
+        self.instructions.append(instruction)
+        await environment.exec("judge-run")
+        raise TimeoutError("judge timed out before scoring")
+
+
+class ResumeAfterMissingScoreJudge(FailingBeforeScoreJudge):
+    SUPPORTS_RESUME = True
+
+    def __init__(self, reward_path: Path, logs_dir: Path, config) -> None:
+        super().__init__(reward_path, logs_dir, config)
+        self.resume_instructions: list[str] = []
+
+    async def resume(self, instruction: str, environment, context: AgentContext) -> None:
+        self.resume_instructions.append(instruction)
+        await FakeJudge.run(self, instruction, environment, context)
+
+
+class FailingSetupJudge(FakeJudge):
+    async def setup(self, environment) -> None:
+        await environment.exec("judge-setup")
+        raise RuntimeError("judge setup failed")
 
 
 def make_task(tmp_path: Path):
@@ -123,6 +158,18 @@ def make_config() -> dict:
             "OPENAI_BASE_URL": "RUBRIC_MODEL_API_BASE",
         },
     }
+
+
+@pytest.mark.asyncio
+async def test_working_directory_environment_clamps_explicit_timeout() -> None:
+    environment = make_environment()
+    judge_environment = _WorkingDirectoryEnvironment(environment, "/judge", 3)
+
+    await judge_environment.exec("long", timeout_sec=99)
+    await judge_environment.exec("short", timeout_sec=1)
+    await judge_environment.exec("default")
+
+    assert [call.kwargs["timeout_sec"] for call in environment.exec.await_args_list] == [3, 1, 3]
 
 
 @pytest.mark.parametrize(
@@ -266,6 +313,187 @@ async def test_runs_judge_through_harbor_agent_factory(
         "reason": "",
         "terminal": True,
     }
+
+
+@pytest.mark.asyncio
+async def test_judge_command_timeout_precedes_client_backstop(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("TEST_JUDGE_KEY", "secret-key")
+    monkeypatch.setenv("TEST_JUDGE_BASE", "https://judge.test/v1")
+    trial_paths = TrialPaths(tmp_path / "trial")
+    trial_paths.mkdir()
+
+    def create_agent(config, **kwargs):
+        return FakeJudge(trial_paths.reward_json_path, kwargs["logs_dir"], config)
+
+    monkeypatch.setattr(
+        "responses_api_agents.gym_harbor_agent.agentic_verifier.AgentFactory.create_agent_from_config",
+        create_agent,
+    )
+    wait_for_timeouts: list[float | None] = []
+    real_wait_for = asyncio.wait_for
+
+    async def recording_wait_for(awaitable, timeout=None):
+        wait_for_timeouts.append(timeout)
+        return await real_wait_for(awaitable, timeout)
+
+    monkeypatch.setattr(asyncio, "wait_for", recording_wait_for)
+    config = make_config()
+    config.update(
+        {
+            "setup_timeout_sec": 2,
+            "run_timeout_sec": 3,
+            "client_timeout_grace_sec": 0.5,
+        }
+    )
+    environment = make_environment()
+    verifier = AgenticVerifier(
+        task=make_task(tmp_path),
+        trial_paths=trial_paths,
+        environment=environment,
+        config=config,
+    )
+
+    result = await verifier.verify()
+
+    assert result.rewards == {"reward": 0.75}
+    assert [call.kwargs["timeout_sec"] for call in environment.exec.await_args_list] == [2, 3]
+    assert wait_for_timeouts == [2.5, 3.5]
+
+
+@pytest.mark.asyncio
+async def test_accepts_terminal_score_recovered_after_judge_error(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("TEST_JUDGE_KEY", "secret-key")
+    monkeypatch.setenv("TEST_JUDGE_BASE", "https://judge.test/v1")
+    trial_paths = TrialPaths(tmp_path / "trial")
+    trial_paths.mkdir()
+
+    def create_agent(config, **kwargs):
+        return FailingAfterScoreJudge(trial_paths.reward_json_path, kwargs["logs_dir"], config)
+
+    monkeypatch.setattr(
+        "responses_api_agents.gym_harbor_agent.agentic_verifier.AgentFactory.create_agent_from_config",
+        create_agent,
+    )
+    verifier = AgenticVerifier(
+        task=make_task(tmp_path),
+        trial_paths=trial_paths,
+        environment=make_environment(),
+        config=make_config(),
+    )
+
+    result = await verifier.verify()
+
+    assert result.rewards == {"reward": 0.75}
+    assert json.loads((trial_paths.verifier_dir / "score_integrity.json").read_text())["terminal"] is True
+
+
+@pytest.mark.asyncio
+async def test_resumes_judge_after_missing_score_without_rerunning_setup(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("TEST_JUDGE_KEY", "secret-key")
+    monkeypatch.setenv("TEST_JUDGE_BASE", "https://judge.test/v1")
+    trial_paths = TrialPaths(tmp_path / "trial")
+    trial_paths.mkdir()
+    created = {}
+
+    def create_agent(config, **kwargs):
+        created["judge"] = ResumeAfterMissingScoreJudge(
+            trial_paths.reward_json_path,
+            kwargs["logs_dir"],
+            config,
+        )
+        return created["judge"]
+
+    monkeypatch.setattr(
+        "responses_api_agents.gym_harbor_agent.agentic_verifier.AgentFactory.create_agent_from_config",
+        create_agent,
+    )
+    config = make_config()
+    config["max_attempts"] = 2
+    environment = make_environment()
+    verifier = AgenticVerifier(
+        task=make_task(tmp_path),
+        trial_paths=trial_paths,
+        environment=environment,
+        config=config,
+    )
+
+    result = await verifier.verify()
+
+    assert result.rewards == {"reward": 0.75}
+    assert created["judge"].instructions == [
+        "Inspect and score /app.\n",
+        created["judge"].resume_instructions[0],
+    ]
+    assert "policy submission is unchanged" in created["judge"].resume_instructions[0]
+    assert "call score_solution exactly once" in created["judge"].resume_instructions[0]
+    assert [call.kwargs["cwd"] for call in environment.exec.await_args_list] == [
+        "/judge",
+        "/judge",
+        "/judge",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_returns_zero_after_exhausting_missing_score_retries(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("TEST_JUDGE_KEY", "secret-key")
+    monkeypatch.setenv("TEST_JUDGE_BASE", "https://judge.test/v1")
+    trial_paths = TrialPaths(tmp_path / "trial")
+    trial_paths.mkdir()
+    created = {}
+
+    def create_agent(config, **kwargs):
+        created["judge"] = FailingBeforeScoreJudge(trial_paths.reward_json_path, kwargs["logs_dir"], config)
+        return created["judge"]
+
+    monkeypatch.setattr(
+        "responses_api_agents.gym_harbor_agent.agentic_verifier.AgentFactory.create_agent_from_config",
+        create_agent,
+    )
+    config = make_config()
+    config["max_attempts"] = 2
+    verifier = AgenticVerifier(
+        task=make_task(tmp_path),
+        trial_paths=trial_paths,
+        environment=make_environment(),
+        config=config,
+    )
+
+    result = await verifier.verify()
+
+    assert result.rewards == {"reward": 0.0}
+    assert len(created["judge"].instructions) == 2
+    assert "Inspect and score /app." in created["judge"].instructions[1]
+    assert "call score_solution exactly once" in created["judge"].instructions[1]
+    assert json.loads((trial_paths.verifier_dir / "score_integrity.json").read_text()) == {
+        "accepted_call_count": 0,
+        "reason": "judge trajectory is missing",
+        "terminal": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_does_not_convert_judge_setup_failure_to_zero(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("TEST_JUDGE_KEY", "secret-key")
+    monkeypatch.setenv("TEST_JUDGE_BASE", "https://judge.test/v1")
+    trial_paths = TrialPaths(tmp_path / "trial")
+    trial_paths.mkdir()
+
+    def create_agent(config, **kwargs):
+        return FailingSetupJudge(trial_paths.reward_json_path, kwargs["logs_dir"], config)
+
+    monkeypatch.setattr(
+        "responses_api_agents.gym_harbor_agent.agentic_verifier.AgentFactory.create_agent_from_config",
+        create_agent,
+    )
+    verifier = AgenticVerifier(
+        task=make_task(tmp_path),
+        trial_paths=trial_paths,
+        environment=make_environment(),
+        config=make_config(),
+    )
+
+    with pytest.raises(RuntimeError, match="judge setup failed"):
+        await verifier.verify()
 
 
 def test_score_integrity_allows_failed_attempt_before_terminal_accepted_call(tmp_path: Path) -> None:

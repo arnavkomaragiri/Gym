@@ -385,6 +385,20 @@ def project_chain_to_output_items(chain: Chain) -> list[dict]:
         generation_length = link.kept_generation_length()
         generation_token_ids = list(entry.generation_token_ids[:generation_length])
         generation_log_probs = list(entry.generation_log_probs[:generation_length])
+
+        def attach_execution_metadata(item: dict) -> None:
+            if entry.routed_experts is not None:
+                item["routed_experts"] = entry.routed_experts
+            for field in (
+                "ng_generation_replica_id",
+                "ng_generation_weight_version",
+                "ng_kv_cache_scheduler_block_size",
+                "ng_kv_cache_hash_block_size",
+            ):
+                value = getattr(entry, field)
+                if value is not None:
+                    item[field] = value
+
         content_items = [dict(item) for item in (entry.output_items or [])]
         index = entry.token_item_index
         if index is not None and 0 <= index < len(content_items):
@@ -401,8 +415,7 @@ def project_chain_to_output_items(chain: Chain) -> list[dict]:
                 item["prompt_token_ids"] = list(cumulative)
                 item["generation_token_ids"] = generation_token_ids
                 item["generation_log_probs"] = generation_log_probs
-                if entry.routed_experts is not None:
-                    item["routed_experts"] = entry.routed_experts
+                attach_execution_metadata(item)
             items.extend(content_items)
         else:
             item = {
@@ -411,8 +424,7 @@ def project_chain_to_output_items(chain: Chain) -> list[dict]:
                 "generation_token_ids": generation_token_ids,
                 "generation_log_probs": generation_log_probs,
             }
-            if entry.routed_experts is not None:
-                item["routed_experts"] = entry.routed_experts
+            attach_execution_metadata(item)
             items.append(item)
         cumulative = cumulative + generation_token_ids
     return items

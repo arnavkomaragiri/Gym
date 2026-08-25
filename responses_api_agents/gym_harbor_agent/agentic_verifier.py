@@ -161,6 +161,17 @@ class AgenticVerifierConfig(BaseModel, extra="forbid"):
     judge_logs_subdir: str = "judge"
     setup_timeout_sec: float | None = Field(default=None, gt=0)
     run_timeout_sec: float | None = Field(default=None, gt=0)
+    client_timeout_grace_sec: float = Field(
+        default=60.0,
+        ge=0,
+        description=("Additional client wait time after the verifier environment's server-enforced command timeout"),
+    )
+    max_attempts: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="Total judge attempts, including the initial attempt",
+    )
 
     @field_validator("instruction_path", "judge_logs_subdir")
     @classmethod
@@ -189,11 +200,17 @@ class AgenticVerifierConfig(BaseModel, extra="forbid"):
 
 
 class _WorkingDirectoryEnvironment:
-    """Duck-typed environment view that supplies a judge-only default cwd."""
+    """Duck-typed environment view with judge-only cwd and timeout limits."""
 
-    def __init__(self, environment: BaseEnvironment, workdir: str) -> None:
+    def __init__(
+        self,
+        environment: BaseEnvironment,
+        workdir: str,
+        default_timeout_sec: float | None = None,
+    ) -> None:
         self._environment = environment
         self._workdir = workdir
+        self._default_timeout_sec = default_timeout_sec
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._environment, name)
@@ -206,11 +223,16 @@ class _WorkingDirectoryEnvironment:
         timeout_sec: int | None = None,
         user: str | int | None = None,
     ):
+        effective_timeout_sec = timeout_sec
+        if self._default_timeout_sec is not None:
+            effective_timeout_sec = (
+                min(timeout_sec, self._default_timeout_sec) if timeout_sec is not None else self._default_timeout_sec
+            )
         return await self._environment.exec(
             command,
             cwd=cwd or self._workdir,
             env=env,
-            timeout_sec=timeout_sec,
+            timeout_sec=effective_timeout_sec,
             user=user,
         )
 
@@ -325,7 +347,10 @@ class AgenticVerifier(BaseVerifier):
         if timeout_sec is None:
             await awaitable
         else:
-            await asyncio.wait_for(awaitable, timeout=timeout_sec)
+            await asyncio.wait_for(
+                awaitable,
+                timeout=timeout_sec + self.config.client_timeout_grace_sec,
+            )
 
     async def _download_judge_logs(self, judge_logs_dir: Path) -> None:
         env_paths = EnvironmentPaths.for_os(self.environment.os)
@@ -370,6 +395,15 @@ class AgenticVerifier(BaseVerifier):
         integrity_path.write_text(result.to_json())
         return result
 
+    @staticmethod
+    def _retry_instruction(score_integrity: ScoreIntegrityResult) -> str:
+        return (
+            "Your previous verifier attempt did not produce a terminal score_solution call "
+            f"({score_integrity.reason}). The policy submission is unchanged. Continue the "
+            "evaluation using any work you already completed, then call score_solution exactly "
+            "once as your final tool call."
+        )
+
     @override
     async def verify(self) -> VerifierResult:
         if "__verifier__" not in self.environment.session_id:
@@ -392,37 +426,101 @@ class AgenticVerifier(BaseVerifier):
         judge.session_id = f"{self.environment.session_id}__judge"
         judge.context_id = self.environment.context_id
         context = AgentContext()
+        setup_environment = _WorkingDirectoryEnvironment(
+            self.environment,
+            self.config.judge_workdir,
+            self.config.setup_timeout_sec,
+        )
         judge_environment = _WorkingDirectoryEnvironment(
             self.environment,
             self.config.judge_workdir,
+            self.config.run_timeout_sec,
         )
 
-        run_error: BaseException | None = None
-        try:
-            with self.environment.scoped_exec_env(judge.extra_env):
-                await self._run_with_timeout(
-                    judge.setup(environment=judge_environment),
-                    self.config.setup_timeout_sec,
-                )
-                await self._run_with_timeout(
-                    judge.run(
-                        instruction=self._instruction(),
-                        environment=judge_environment,
-                        context=context,
-                    ),
-                    self.config.run_timeout_sec,
-                )
-        except BaseException as exc:
-            run_error = exc
-        finally:
-            await self._download_judge_logs(judge_logs_dir)
-            judge.populate_context_post_run(context)
-            (judge_logs_dir / "context.json").write_text(context.model_dump_json(indent=2))
+        instruction = self._instruction()
+        setup_complete = False
+        previous_score_integrity: ScoreIntegrityResult | None = None
+        for attempt in range(1, self.config.max_attempts + 1):
+            run_error: BaseException | None = None
+            score_integrity: ScoreIntegrityResult | None = None
+            try:
+                with self.environment.scoped_exec_env(judge.extra_env):
+                    if not setup_complete:
+                        await self._run_with_timeout(
+                            judge.setup(environment=setup_environment),
+                            self.config.setup_timeout_sec,
+                        )
+                        setup_complete = True
 
-        if run_error is not None:
-            raise run_error
-        score_integrity = self._score_integrity(judge_logs_dir)
-        if not score_integrity.terminal:
-            self.logger.error("Rejecting non-terminal agentic judge score: %s", score_integrity.reason)
-            return VerifierResult(rewards={"reward": 0.0})
-        return VerifierResult(rewards=self._parse_rewards())
+                    retry_instruction: str | None = None
+                    if attempt > 1:
+                        assert previous_score_integrity is not None
+                        retry_instruction = self._retry_instruction(previous_score_integrity)
+                    if retry_instruction is not None and getattr(judge, "SUPPORTS_RESUME", False):
+                        judge_run = judge.resume(
+                            instruction=retry_instruction,
+                            environment=judge_environment,
+                            context=context,
+                        )
+                    else:
+                        attempt_instruction = instruction
+                        if retry_instruction is not None:
+                            attempt_instruction += "\n\n" + retry_instruction
+                        judge_run = judge.run(
+                            instruction=attempt_instruction,
+                            environment=judge_environment,
+                            context=context,
+                        )
+                    await self._run_with_timeout(judge_run, self.config.run_timeout_sec)
+            except BaseException as exc:
+                run_error = exc
+            finally:
+                try:
+                    await self._download_judge_logs(judge_logs_dir)
+                    judge.populate_context_post_run(context)
+                    (judge_logs_dir / "context.json").write_text(context.model_dump_json(indent=2))
+                finally:
+                    # A judge command can fail while winding down after score_solution
+                    # succeeded. Inspect the recovered trajectory before retrying.
+                    score_integrity = self._score_integrity(judge_logs_dir)
+
+            assert score_integrity is not None
+            if score_integrity.terminal:
+                if run_error is not None:
+                    self.logger.warning(
+                        "Accepting terminal agentic judge score recovered after %s: %s",
+                        type(run_error).__name__,
+                        run_error,
+                    )
+                return VerifierResult(rewards=self._parse_rewards())
+
+            if not setup_complete:
+                assert run_error is not None
+                raise run_error
+            if isinstance(run_error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                raise run_error
+            if score_integrity.accepted_call_count != 0:
+                self.logger.error(
+                    "Rejecting ambiguous agentic judge score with reward 0: %s",
+                    score_integrity.reason,
+                )
+                return VerifierResult(rewards={"reward": 0.0})
+            if attempt == self.config.max_attempts:
+                self.logger.error(
+                    "Agentic judge produced no accepted score after %d attempts; returning reward 0. "
+                    "Last integrity result: %s",
+                    attempt,
+                    score_integrity.reason,
+                )
+                return VerifierResult(rewards={"reward": 0.0})
+
+            self.logger.warning(
+                "Agentic judge attempt %d/%d produced no accepted score%s; retrying the fixed submission: %s",
+                attempt,
+                self.config.max_attempts,
+                f" after {type(run_error).__name__}: {run_error}" if run_error is not None else "",
+                score_integrity.reason,
+            )
+            previous_score_integrity = score_integrity
+
+        raise AssertionError("unreachable")

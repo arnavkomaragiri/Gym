@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -12,8 +13,10 @@ from responses_api_agents.gym_harbor_agent.audited_opencode import (
     POLICY_FILE_TRACE_FILENAME,
     AlertedOpenCode,
     AuditedOpenCode,
+    OpenCodeProcessRLimitConfig,
     PreinstalledOpenCode,
     _OpenCodeAlertingEnvironment,
+    _OpenCodeProcessLimitEnvironment,
     _PolicyTracingEnvironment,
 )
 
@@ -26,6 +29,54 @@ class FakeEnvironment:
     async def exec(self, command, **kwargs):
         self.calls.append((command, kwargs))
         return SimpleNamespace(return_code=0, stdout="", stderr="")
+
+
+def _write_session_database(tmp_path, messages):
+    database_path = tmp_path / "opencode" / "xdg-data" / "opencode" / "opencode.db"
+    database_path.parent.mkdir(parents=True)
+    connection = sqlite3.connect(database_path)
+    try:
+        connection.executescript(
+            """
+            CREATE TABLE session (id TEXT PRIMARY KEY, parent_id TEXT, time_created INTEGER);
+            CREATE TABLE message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT,
+                time_created INTEGER,
+                data TEXT
+            );
+            CREATE TABLE part (
+                id TEXT PRIMARY KEY,
+                message_id TEXT,
+                session_id TEXT,
+                time_created INTEGER,
+                data TEXT
+            );
+            """
+        )
+        connection.execute("INSERT INTO session VALUES (?, ?, ?)", ("session-1", None, 1))
+        part_index = 0
+        for message in messages:
+            message_id = message["id"]
+            connection.execute(
+                "INSERT INTO message VALUES (?, ?, ?, ?)",
+                (message_id, "session-1", message["timestamp"], json.dumps(message["info"])),
+            )
+            for part in message["parts"]:
+                part_index += 1
+                connection.execute(
+                    "INSERT INTO part VALUES (?, ?, ?, ?, ?)",
+                    (
+                        f"part-{part_index}",
+                        message_id,
+                        "session-1",
+                        message["timestamp"] + part_index,
+                        json.dumps(part),
+                    ),
+                )
+        connection.commit()
+    finally:
+        connection.close()
 
 
 @pytest.mark.asyncio
@@ -56,6 +107,24 @@ async def test_rejects_multiple_policy_commands():
     await environment.exec(command)
     with pytest.raises(RuntimeError, match="more than once"):
         await environment.exec(command)
+
+
+@pytest.mark.asyncio
+async def test_process_limit_wraps_only_opencode_run_and_is_inherited_by_children():
+    delegate = FakeEnvironment()
+    environment = _OpenCodeProcessLimitEnvironment(
+        delegate,
+        OpenCodeProcessRLimitConfig(address_space_mib=49152),
+    )
+
+    await environment.exec("opencode --version")
+    await environment.exec("opencode --model=nemo/test run --format=json -- prompt")
+
+    assert delegate.calls[0][0] == "opencode --version"
+    limited_command = delegate.calls[1][0]
+    assert limited_command.startswith("set -e; ulimit -S -v 50331648; ulimit -H -v 50331648; ")
+    assert limited_command.endswith("opencode --model=nemo/test run --format=json -- prompt")
+    assert environment.command_wrapped is True
 
 
 @pytest.mark.asyncio
@@ -258,14 +327,151 @@ async def test_alert_metadata_is_added_after_trajectory_population(
         },
     ]
     (tmp_path / "opencode.txt").write_text("".join(json.dumps(event) + "\n" for event in events))
+    _write_session_database(
+        tmp_path,
+        [
+            {
+                "id": "user-1",
+                "timestamp": 1,
+                "info": {"role": "user"},
+                "parts": [{"type": "text", "text": "Analyze the data."}],
+            },
+            {
+                "id": "assistant-1",
+                "timestamp": 2,
+                "info": {"role": "assistant", "parentID": "user-1", "finish": "stop"},
+                "parts": [
+                    {"type": "step-start"},
+                    {"type": "text", "text": "done", "time": {"end": 3}},
+                    {"type": "step-finish", "reason": "stop", "tokens": {"input": 7, "output": 2}},
+                ],
+            },
+            {
+                "id": "user-alert",
+                "timestamp": 10,
+                "info": {"role": "user"},
+                "parts": [{"type": "text", "text": alert_message}],
+            },
+            {
+                "id": "assistant-alert",
+                "timestamp": 11,
+                "info": {"role": "assistant", "parentID": "user-alert", "finish": "stop"},
+                "parts": [
+                    {"type": "step-start"},
+                    {"type": "text", "text": "submitted", "time": {"end": 12}},
+                    {"type": "step-finish", "reason": "stop", "tokens": {"input": 9, "output": 1}},
+                ],
+            },
+        ],
+    )
 
     agent.populate_context_post_run(context)
 
     assert (tmp_path / "trajectory.json").is_file()
-    assert context.n_input_tokens == 7
-    assert context.n_output_tokens == 2
+    assert context.n_input_tokens == 16
+    assert context.n_output_tokens == 3
     assert context.metadata is not None
     assert context.metadata["runtime_alerts"][0]["delivered"] is True
+    assert context.metadata["runtime_alerts"][0]["session_user_turn_recorded"] is True
+    assert context.metadata["runtime_alerts"][0]["session_alert_processed"] is True
+    assert context.metadata["runtime_alerts"][0]["session_zero_token_length"] is False
+    assert context.metadata["opencode_session_capture"]["source"] == "database"
+
+
+def test_alerted_opencode_tracks_overflow_compaction_and_replayed_alert(tmp_path):
+    alert_message = "You have five minutes remaining."
+    agent = AlertedOpenCode(
+        logs_dir=tmp_path,
+        model_name="nemo/test",
+        alert_schedule={
+            "deadline_seconds": 60,
+            "alerts": [{"remaining_seconds": 30, "message": alert_message}],
+        },
+    )
+    agent._runtime_alert_status = [{"name": "remaining_30s", "delivered": True}]
+    agent._session_events = [
+        {
+            "type": "user",
+            "messageID": "alert-original",
+            "parts": [{"type": "text", "text": alert_message}],
+        },
+        {
+            "type": "error",
+            "messageID": "assistant-overflow",
+            "parentID": "alert-original",
+            "error": {"name": "ContextOverflowError"},
+        },
+        {
+            "type": "user",
+            "messageID": "compact-user",
+            "parts": [{"type": "compaction", "auto": True, "overflow": True}],
+        },
+        {"type": "compaction", "messageID": "compact-user"},
+        {
+            "type": "step_finish",
+            "messageID": "compact-assistant",
+            "parentID": "compact-user",
+            "assistantSummary": True,
+            "part": {"reason": "stop", "tokens": {"input": 100, "output": 20}},
+        },
+        {
+            "type": "user",
+            "messageID": "alert-replay",
+            "parts": [{"type": "text", "text": alert_message}],
+        },
+        {
+            "type": "step_finish",
+            "messageID": "assistant-replay",
+            "parentID": "alert-replay",
+            "assistantSummary": False,
+            "part": {"reason": "stop", "tokens": {"input": 30, "output": 2}},
+        },
+    ]
+
+    agent._annotate_alert_outcomes()
+
+    status = agent._runtime_alert_status[0]
+    assert status["session_direct_context_overflow"] is True
+    assert status["session_compaction_recorded"] is True
+    assert status["session_compaction_completed"] is True
+    assert status["session_alert_replayed"] is True
+    assert status["session_alert_processed"] is True
+    assert status["session_replay_prompt_tokens"] == 30
+    assert status["session_replay_completion_tokens"] == 2
+
+
+def test_alerted_opencode_does_not_treat_zero_token_length_as_processed(tmp_path):
+    alert_message = "You have five minutes remaining."
+    agent = AlertedOpenCode(
+        logs_dir=tmp_path,
+        model_name="nemo/test",
+        alert_schedule={
+            "deadline_seconds": 60,
+            "alerts": [{"remaining_seconds": 30, "message": alert_message}],
+        },
+    )
+    agent._runtime_alert_status = [{"name": "remaining_30s", "delivered": True}]
+    agent._session_events = [
+        {
+            "type": "user",
+            "messageID": "alert-original",
+            "parts": [{"type": "text", "text": alert_message}],
+        },
+        {
+            "type": "step_finish",
+            "messageID": "assistant-empty",
+            "parentID": "alert-original",
+            "assistantSummary": False,
+            "part": {"reason": "length", "tokens": {"input": 0, "output": 0}},
+        },
+    ]
+
+    agent._annotate_alert_outcomes()
+
+    status = agent._runtime_alert_status[0]
+    assert status["session_zero_token_length"] is True
+    assert status["session_alert_processed"] is False
+    assert status["session_compaction_recorded"] is False
 
 
 def test_alerted_opencode_preserves_alert_as_user_turn(tmp_path):

@@ -161,11 +161,17 @@ class TestValidation:
                 sandbox_path_copies=[{"source": "../dataset", "destination": "/app/data"}],
             )
 
-    def test_rejects_shared_artifact_root_inside_source(self, tmp_path):
-        with pytest.raises(ValueError, match="must not overlap"):
+    def test_shared_workspace_host_path_must_end_in_context_id(self, tmp_path):
+        with pytest.raises(ValueError, match=r"end with the \{context_id\} placeholder"):
             _make_environment(
                 tmp_path,
-                shared_artifact_transfer={"root": "/app/.relay", "sources": ["/app"]},
+                shared_workspace={
+                    "volume": {
+                        "name": "policy-workspace",
+                        "host": {"path": "/mnt/efs/data/shared/akomaragiri/test-run/static"},
+                        "mountPath": "/app",
+                    }
+                },
             )
 
 
@@ -208,6 +214,7 @@ class TestStartStop:
                 "volumes": [
                     {
                         "name": "capsules",
+                        "host_path": "/mnt/s3/data/train/{task_name}",
                         "mount_path": "/app/data",
                         "sub_path": "CapsuleFolder-{task_id}",
                     }
@@ -221,12 +228,33 @@ class TestStartStop:
             "volumes": [
                 {
                     "name": "capsules",
+                    "host_path": "/mnt/s3/data/train/example-task",
                     "mount_path": "/app/data",
                     "sub_path": "CapsuleFolder-example-task",
                 }
             ],
             "extensions": {"trial": "example-task__trial-1", "task": "example-task"},
         }
+
+    @pytest.mark.asyncio
+    async def test_start_rejects_unknown_provider_option_template_before_create(self, tmp_path):
+        env = _make_environment(
+            tmp_path,
+            sandbox_provider_options={
+                "volumes": [
+                    {
+                        "name": "capsules",
+                        "host_path": "/mnt/s3/data/train/{task_nmae}",
+                        "mount_path": "/app/data",
+                    }
+                ]
+            },
+        )
+
+        with pytest.raises(ValueError, match=r"Unsupported template placeholder.*\{task_nmae\}"):
+            await env.start(force_build=False)
+
+        assert FakeProvider.instances == []
 
     @pytest.mark.asyncio
     async def test_start_copies_mounted_task_data_before_environment_upload(self, tmp_path):
@@ -468,21 +496,37 @@ class TestStartStop:
         assert "find /app -mindepth 1 -maxdepth 1" in command
 
 
-class TestSharedArtifactTransfer:
+class TestDirectSharedWorkspace:
     @staticmethod
     def _config() -> dict:
         return {
-            "root": "/mnt/efs-data/.nemo-gym-harbor-artifacts",
-            "sources": ["/app"],
-            "timeout_s": 60,
+            "volume": {
+                "name": "policy-workspace",
+                "host": {"path": "/mnt/efs/data/shared/akomaragiri/nemo-gym-harbor-artifacts/test-run/{context_id}"},
+                "mountPath": "/app",
+            },
+            "handoff_timeout_s": 60,
+            "cleanup_timeout_s": 60,
+            "cleanup_ttl_s": 120,
         }
 
     @pytest.mark.asyncio
-    async def test_relays_workspace_only_after_confirmed_policy_stop(self, tmp_path):
+    async def test_handoff_is_zero_copy_and_verifier_mount_is_read_only(self, tmp_path):
         context_id = uuid4()
         source_env = _make_environment(
             tmp_path,
-            shared_artifact_transfer=self._config(),
+            shared_workspace=self._config(),
+            sandbox_path_symlinks=[{"source": "/data", "destination": "/app/data"}],
+            sandbox_provider_options={
+                "volumes": [
+                    {
+                        "name": "problem-data",
+                        "host": {"path": "/mnt/s3/data/train/{task_name}"},
+                        "mountPath": "/data",
+                        "readOnly": True,
+                    }
+                ]
+            },
         )
         source_env.context_id = context_id
         await source_env.start(force_build=False)
@@ -493,19 +537,38 @@ class TestSharedArtifactTransfer:
         await source_env.download_dir_with_exclusions(
             source_dir="/app",
             target_dir=artifact_dir,
-            exclude=["data"],
+            exclude=["data", ".opencode"],
         )
-        marker_path = artifact_dir / ".nemo-gym-shared-artifact.json"
+        marker_path = artifact_dir / ".nemo-gym-shared-workspace.json"
         before_stop = json.loads(marker_path.read_text())
         assert before_stop["source_environment_stopped"] is False
         assert before_stop["consumed"] is False
-        snapshot_command = source_provider.exec_calls[-1]["command"]
-        assert "--exclude=data" in snapshot_command
-        assert str(context_id) in snapshot_command
+        assert before_stop["host_path"].endswith(f"/test-run/{context_id}")
+        policy_volume, data_volume = source_provider.created_specs[0].provider_options["volumes"]
+        assert policy_volume == {
+            "name": "policy-workspace",
+            "host": {"path": f"/mnt/efs/data/shared/akomaragiri/nemo-gym-harbor-artifacts/test-run/{context_id}"},
+            "mountPath": "/app",
+            "readOnly": False,
+        }
+        assert data_volume["mountPath"] == "/data"
+        assert data_volume["readOnly"] is True
+        symlink_command = source_provider.exec_calls[1]["command"]
+        assert "ln -s -- /data /app/data" in symlink_command
+        handoff_command = source_provider.exec_calls[-1]["command"]
+        assert "rm -rf -- /app/.opencode" in handoff_command
+        assert "test -L /app/data" in handoff_command
+        assert "rm -rf -- /app/data" not in handoff_command
+        assert "--exclude=data" in handoff_command
+        assert "cp -a" not in handoff_command
+        assert "workspace.tar" not in handoff_command
+        assert source_provider.uploads == {}
+        assert source_provider.downloads == {}
 
         await source_env.stop(delete=True)
         after_stop = json.loads(marker_path.read_text())
         assert after_stop["source_environment_stopped"] is True
+        assert len(FakeProvider.instances) == 1
 
         FakeProvider.instances.clear()
         tests_dir = tmp_path / "task" / "steps" / "rollout" / "tests"
@@ -515,91 +578,111 @@ class TestSharedArtifactTransfer:
             tmp_path,
             environment_dir=tests_dir,
             session_id="example-task__trial-1__verifier__rollout",
-            shared_artifact_transfer=self._config(),
+            shared_workspace=self._config(),
+            sandbox_path_symlinks=[{"source": "/data", "destination": "/app/data"}],
+            sandbox_provider_options={
+                "volumes": [
+                    {
+                        "name": "problem-data",
+                        "host": {"path": "/mnt/s3/data/train/{task_name}"},
+                        "mountPath": "/data",
+                        "readOnly": True,
+                    }
+                ]
+            },
         )
         verifier_env.context_id = context_id
         await verifier_env.start(force_build=False)
         verifier_provider = _provider()
+        verifier_symlink_command = verifier_provider.exec_calls[1]["command"]
+        assert "test -L /app/data" in verifier_symlink_command
+        assert "ln -s" not in verifier_symlink_command
+        _, verifier_data_volume = verifier_provider.created_specs[0].provider_options["volumes"]
+        assert verifier_data_volume["mountPath"] == "/data"
+        assert verifier_data_volume["readOnly"] is True
         verifier_provider.exec_calls.clear()
+        verifier_provider.uploads.clear()
+        verifier_provider.queue_exec_result(SandboxExecResult(stdout=f"{'a' * 64}\n", stderr=None, return_code=0))
 
         await verifier_env.upload_dir(artifact_dir, "/app")
 
-        restore_command = verifier_provider.exec_calls[0]["command"]
-        assert "cp -a --" in restore_command
-        assert "workspace.tar" in restore_command
-        assert "sha256sum" in restore_command
-        assert f"rm -rf -- /mnt/efs-data/.nemo-gym-harbor-artifacts/v1/{context_id}" not in restore_command
+        verifier_volume = verifier_provider.created_specs[0].provider_options["volumes"][0]
+        assert verifier_volume["host"]["path"].endswith(f"/test-run/{context_id}")
+        assert verifier_volume["mountPath"] == "/app"
+        assert verifier_volume["readOnly"] is True
+        assert len(verifier_provider.exec_calls) == 1
+        assert "sha256sum" in verifier_provider.exec_calls[0]["command"]
+        assert "cp -a" not in verifier_provider.exec_calls[0]["command"]
+        assert verifier_provider.uploads == {}
+        assert verifier_provider.downloads == {}
         assert json.loads(marker_path.read_text())["consumed"] is True
 
         await verifier_env.stop(delete=True)
 
-        cleanup_command = verifier_provider.exec_calls[-1]["command"]
-        assert f"rm -rf -- /mnt/efs-data/.nemo-gym-harbor-artifacts/v1/{context_id}" in cleanup_command
         assert verifier_provider.closed_handles == ["sbx-123"]
+        assert len(FakeProvider.instances) == 2
+        cleanup_provider = FakeProvider.instances[1]
+        cleanup_volume = cleanup_provider.created_specs[0].provider_options["volumes"][0]
+        assert cleanup_volume == {
+            "name": "policy-workspace-cleanup",
+            "host": {"path": "/mnt/efs/data/shared/akomaragiri/nemo-gym-harbor-artifacts/test-run"},
+            "mountPath": "/nemo-gym-workspace-cleanup",
+            "readOnly": False,
+        }
+        assert cleanup_provider.created_specs[0].metadata["harbor-role"] == "workspace-cleanup"
+        assert f"rm -rf -- /nemo-gym-workspace-cleanup/{context_id}" in cleanup_provider.exec_calls[0]["command"]
+        assert cleanup_provider.closed_handles == ["sbx-123"]
 
     @pytest.mark.asyncio
-    async def test_verifier_cleanup_failure_still_terminates_sandbox(self, tmp_path):
+    async def test_unconsumed_policy_workspace_is_cleaned_after_policy_stop(self, tmp_path):
         context_id = uuid4()
-        artifact_dir = tmp_path / "artifacts" / "app"
-        artifact_dir.mkdir(parents=True)
-        marker_path = artifact_dir / ".nemo-gym-shared-artifact.json"
-        marker_path.write_text(
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "context_id": str(context_id),
-                    "source": "/app",
-                    "remote_path": (f"/mnt/efs-data/.nemo-gym-harbor-artifacts/v1/{context_id}/transfer"),
-                    "sha256": "a" * 64,
-                    "source_environment_stopped": True,
-                    "consumed": False,
-                }
-            )
-        )
-        tests_dir = tmp_path / "task" / "steps" / "rollout" / "tests"
-        tests_dir.mkdir(parents=True)
-        verifier_env = _make_environment(
-            tmp_path,
-            environment_dir=tests_dir,
-            session_id="example-task__trial-1__verifier__rollout",
-            shared_artifact_transfer=self._config(),
-        )
-        verifier_env.context_id = context_id
-        await verifier_env.start(force_build=False)
-        provider = _provider()
-        provider.exec_calls.clear()
-        await verifier_env.upload_dir(artifact_dir, "/app")
-        provider.queue_exec_result(SandboxExecResult(stdout="", stderr="EFS unavailable", return_code=1))
+        env = _make_environment(tmp_path, shared_workspace=self._config())
+        env.context_id = context_id
+        await env.start(force_build=False)
+        policy_provider = _provider()
 
-        with pytest.raises(RuntimeError, match="EFS unavailable"):
-            await verifier_env.stop(delete=True)
+        await env.stop(delete=True)
 
-        assert provider.closed_handles == ["sbx-123"]
+        assert policy_provider.closed_handles == ["sbx-123"]
+        assert len(FakeProvider.instances) == 2
+        cleanup_provider = FakeProvider.instances[1]
+        assert f"rm -rf -- /nemo-gym-workspace-cleanup/{context_id}" in cleanup_provider.exec_calls[0]["command"]
 
     @pytest.mark.asyncio
     async def test_rejects_shared_workspace_before_policy_stop(self, tmp_path):
+        context_id = uuid4()
         env = _make_environment(
             tmp_path,
-            shared_artifact_transfer=self._config(),
+            shared_workspace=self._config(),
         )
+        env.context_id = context_id
         await env.start(force_build=False)
         _provider().queue_exec_result(SandboxExecResult(stdout=f"{'a' * 64}\n", stderr=None, return_code=0))
         artifact_dir = tmp_path / "artifacts" / "app"
         await env.download_dir(source_dir="/app", target_dir=artifact_dir)
 
+        FakeProvider.instances.clear()
+        verifier_env = _make_environment(
+            tmp_path,
+            session_id="example-task__trial-1__verifier__rollout",
+            shared_workspace=self._config(),
+        )
+        verifier_env.context_id = context_id
+        await verifier_env.start(force_build=False)
+
         with pytest.raises(RuntimeError, match="before source sandbox teardown"):
-            await env.upload_dir(artifact_dir, "/app")
+            await verifier_env.upload_dir(artifact_dir, "/app")
 
     @pytest.mark.asyncio
-    async def test_snapshot_failure_reports_sandbox_stdout_and_stderr(self, tmp_path):
+    async def test_workspace_validation_failure_reports_stdout_and_stderr(self, tmp_path):
         env = _make_environment(
             tmp_path,
-            shared_artifact_transfer=self._config(),
+            shared_workspace=self._config(),
         )
         await env.start(force_build=False)
         _provider().queue_exec_result(
             SandboxExecResult(
-                stdout="unsupported artifact entry: ./linked-file\n",
+                stdout="unsupported workspace entry: ./socket\n",
                 stderr="exit status 73",
                 return_code=73,
             )
@@ -612,20 +695,20 @@ class TestSharedArtifactTransfer:
                 exclude=["data", ".opencode"],
             )
 
-        assert "unsupported artifact entry: ./linked-file" in str(error.value)
+        assert "unsupported workspace entry: ./socket" in str(error.value)
         assert "exit status 73" in str(error.value)
 
     @pytest.mark.asyncio
     async def test_failed_policy_stop_does_not_authorize_shared_handoff(self, tmp_path):
         env = _make_environment(
             tmp_path,
-            shared_artifact_transfer=self._config(),
+            shared_workspace=self._config(),
         )
         await env.start(force_build=False)
         _provider().queue_exec_result(SandboxExecResult(stdout=f"{'a' * 64}\n", stderr=None, return_code=0))
         artifact_dir = tmp_path / "artifacts" / "app"
         await env.download_dir(source_dir="/app", target_dir=artifact_dir)
-        marker_path = artifact_dir / ".nemo-gym-shared-artifact.json"
+        marker_path = artifact_dir / ".nemo-gym-shared-workspace.json"
         provider = _provider()
         provider.close = AsyncMock(side_effect=TimeoutError("kill timed out"))
 

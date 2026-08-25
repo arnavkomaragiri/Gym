@@ -9,17 +9,18 @@ gym_harbor_agent:
     gym_harbor_agent:
       verifier:
         import_path: responses_api_agents.gym_harbor_agent.agentic_verifier:AgenticVerifier
-        override_timeout_sec: 2400
+        # Keep this below the default 7200s OpenSandbox TTL so retry exhaustion
+        # can return a zero reward instead of losing the rollout to sandbox expiry.
+        override_timeout_sec: 7000
         kwargs:
           config:
             judge_agent:
               name: null
-              import_path: responses_api_agents.gym_harbor_agent.audited_opencode:AuditedOpenCode
+              import_path: responses_api_agents.gym_harbor_agent.audited_opencode:PreinstalledOpenCode
               model_name: ${oc.env:RUBRIC_MODEL}
               env: {}
               kwargs:
                 use_preinstalled: true
-                trace_filename: .judge-fs.trace
               mcp_servers:
                 - name: harbor_score
                   transport: stdio
@@ -37,21 +38,15 @@ gym_harbor_agent:
             reward_path: /logs/verifier/reward.json
             judge_logs_subdir: judge
             setup_timeout_sec: 900
-            run_timeout_sec: 1400
+            run_timeout_sec: 2400
+            client_timeout_grace_sec: 60
+            # Two full attempts fit beneath the 7000s verifier cap while
+            # preserving headroom for setup, integrity checks, and teardown.
+            max_attempts: 2
 
-      # The judge receives a sandbox-local policy snapshot at /app. Trace both
-      # expected reads and suspicious writes there, plus any direct EFS access.
-      verifier_file_access_audit:
-        trace_subdir: judge
-        trace_filename: .judge-fs.trace
-        audited_paths:
-          policy_artifacts: /app
-          efs: ${oc.env:HARBOR_EFS_ARTIFACT_MOUNT_PATH,/mnt/nemo-gym-harbor-artifacts}
-
-      # Harbor collects this after the policy exits and rehydrates it at the
-      # same path in the separate verifier sandbox. OpenCode's harness-owned
-      # local state is never part of the submission. Add data to the override
-      # only when /app/data is independently mounted into both sandboxes.
+      # Harbor records an integrity marker after the policy exits. The separate
+      # verifier consumes the marker against its direct read-only /app mount;
+      # no policy files pass through the Gym host.
       artifacts:
         - source: /app
           exclude: ${oc.create:${oc.env:HARBOR_POLICY_WORKSPACE_EXCLUDES,[.opencode]}}
