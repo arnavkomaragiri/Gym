@@ -10,6 +10,7 @@ import sqlite3
 from pathlib import Path, PurePath
 from typing import Any, cast, override
 
+from harbor.agents.installed.base import CliFlag
 from harbor.agents.installed.opencode import OpenCode
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
@@ -31,6 +32,11 @@ _PREINSTALLED_OPENCODE_CHECK = (
     'set -euo pipefail; test -r "$HOME/.nvm/nvm.sh"; '
     '. "$HOME/.nvm/nvm.sh"; command -v opencode >/dev/null; opencode --version'
 )
+_OPENCODE_CLI_FLAGS_WITHOUT_TITLE_GENERATION = [
+    *OpenCode.CLI_FLAGS,
+    # A non-default session title makes OpenCode skip its title-model request.
+    CliFlag("session_title", cli="--title", type="str", default="nemo-gym"),
+]
 
 
 class OpenCodeProcessRLimitConfig(BaseModel):
@@ -359,6 +365,8 @@ class _PolicyTracingEnvironment(_OpenCodeTracingEnvironment):
 class PreinstalledOpenCode(OpenCode):
     """Use the OpenCode installation baked into the sandbox image."""
 
+    CLI_FLAGS = _OPENCODE_CLI_FLAGS_WITHOUT_TITLE_GENERATION
+
     @override
     async def install(self, environment: BaseEnvironment) -> None:
         await self.exec_as_agent(environment, command=_PREINSTALLED_OPENCODE_CHECK)
@@ -366,6 +374,8 @@ class PreinstalledOpenCode(OpenCode):
 
 class AlertedOpenCode(OpenCode):
     """Inject configured time-left warnings as native OpenCode user turns."""
+
+    CLI_FLAGS = _OPENCODE_CLI_FLAGS_WITHOUT_TITLE_GENERATION
 
     def __init__(
         self,

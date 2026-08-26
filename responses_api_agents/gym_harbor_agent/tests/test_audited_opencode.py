@@ -141,6 +141,30 @@ async def test_preinstalled_opencode_only_checks_baked_install(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("agent_class", [PreinstalledOpenCode, AlertedOpenCode])
+async def test_opencode_wrappers_set_fixed_title_to_skip_title_generation(
+    tmp_path, agent_class
+):
+    environment = FakeEnvironment()
+    agent = agent_class(logs_dir=tmp_path, model_name="nemo/test")
+
+    await agent.run("Analyze the data.", environment, AgentContext())
+
+    run_command = next(
+        command
+        for command, _kwargs in environment.calls
+        if "opencode --model=" in command
+    )
+    assert "--title nemo-gym" in run_command
+
+
+def test_opencode_title_generation_can_be_explicitly_restored(tmp_path):
+    agent = PreinstalledOpenCode(logs_dir=tmp_path, session_title=None)
+
+    assert "--title" not in agent.build_cli_flags()
+
+
+@pytest.mark.asyncio
 async def test_audited_opencode_checks_baked_trace_tools(tmp_path):
     environment = FakeEnvironment()
     agent = AuditedOpenCode(logs_dir=tmp_path, use_preinstalled=True)
