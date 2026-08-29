@@ -5,8 +5,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from harbor.models.trial.config import AgentConfig, ArtifactConfig, VerifierConfig
 from omegaconf import OmegaConf
-
-from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
 from responses_api_agents.gym_harbor_agent.app import (
     ALERTED_OPENCODE_IMPORT_PATH,
     AUDITED_OPENCODE_IMPORT_PATH,
@@ -23,6 +21,8 @@ from responses_api_agents.gym_harbor_agent.app import (
     _validated_judge_score_integrity_metrics,
     _verifier_file_access_audit_metrics,
 )
+
+from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
 
 
 def test_failure_class_preserves_sandbox_lifecycle_reset_through_wrapper():
@@ -45,6 +45,38 @@ def test_missing_judge_integrity_does_not_mask_absent_verifier_result(tmp_path: 
     trial = SimpleNamespace(verifier_result=None)
 
     with pytest.raises(RuntimeError, match="did not produce a result or a host score-integrity verdict"):
+        _validated_judge_score_integrity_metrics(trial, [trajectory_path])
+
+
+def test_accepts_audited_host_fallback_zero(tmp_path: Path) -> None:
+    trajectory_path = tmp_path / "steps" / "rollout" / "agent" / "trajectory.json"
+    trajectory_path.parent.mkdir(parents=True)
+    trajectory_path.write_text("{}")
+    verifier_dir = trajectory_path.parent.parent / "verifier"
+    verifier_dir.mkdir()
+    (verifier_dir / "score_integrity.json").write_text(
+        '{"terminal": false, "accepted_call_count": 0, "reason": "retries exhausted", "host_fallback_zero": true}'
+    )
+    trial = SimpleNamespace(verifier_result=SimpleNamespace(rewards={"reward": 0.0}))
+
+    metrics = _validated_judge_score_integrity_metrics(trial, [trajectory_path])
+
+    assert metrics["judge_score_terminal"] is False
+    assert metrics["judge_score_host_fallback_zero"] is True
+
+
+def test_rejects_nonzero_reward_with_host_fallback_verdict(tmp_path: Path) -> None:
+    trajectory_path = tmp_path / "steps" / "rollout" / "agent" / "trajectory.json"
+    trajectory_path.parent.mkdir(parents=True)
+    trajectory_path.write_text("{}")
+    verifier_dir = trajectory_path.parent.parent / "verifier"
+    verifier_dir.mkdir()
+    (verifier_dir / "score_integrity.json").write_text(
+        '{"terminal": false, "accepted_call_count": 0, "reason": "retries exhausted", "host_fallback_zero": true}'
+    )
+    trial = SimpleNamespace(verifier_result=SimpleNamespace(rewards={"reward": 0.5}))
+
+    with pytest.raises(RuntimeError, match="requires zero rewards"):
         _validated_judge_score_integrity_metrics(trial, [trajectory_path])
 
 

@@ -35,6 +35,11 @@ from harbor.models.trial.config import (
 from harbor.models.trial.paths import TrialPaths
 from harbor.models.trial.result import TrialResult
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
+from responses_api_agents.gym_harbor_agent.alerts import AlertScheduleConfig
+from responses_api_agents.harbor_agent.custom_envs.nemo_gym_sandbox.environment import (
+    SharedWorkspaceConfig,
+    validate_sandbox_template_placeholders,
+)
 
 from nemo_gym.base_resources_server import BaseRunRequest, BaseVerifyResponse
 from nemo_gym.base_responses_api_agent import (
@@ -52,11 +57,6 @@ from nemo_gym.openai_utils import (
     NeMoGymResponseCreateParamsNonStreaming,
 )
 from nemo_gym.rollout_collection import NG_FAILURE_CLASS_KEY
-from responses_api_agents.gym_harbor_agent.alerts import AlertScheduleConfig
-from responses_api_agents.harbor_agent.custom_envs.nemo_gym_sandbox.environment import (
-    SharedWorkspaceConfig,
-    validate_sandbox_template_placeholders,
-)
 
 
 logger = logging.getLogger(__name__)
@@ -115,8 +115,7 @@ def _sandbox_step_infra_error(trial: TrialResult) -> str | None:
             continue
         rendered = f"{exception_info.exception_type}: {exception_info.exception_message}"
         if any(
-            marker in rendered
-            for marker in (*_SANDBOX_LIFECYCLE_RESET_MARKERS, *_SANDBOX_BACKEND_UNREACHABLE_MARKERS)
+            marker in rendered for marker in (*_SANDBOX_LIFECYCLE_RESET_MARKERS, *_SANDBOX_BACKEND_UNREACHABLE_MARKERS)
         ):
             return rendered
     return None
@@ -395,10 +394,12 @@ def _judge_score_integrity_metrics(trajectory_paths: list[Path]) -> dict[str, bo
 
     results = [json.loads(path.read_text()) for path in integrity_paths]
     terminal = all(result.get("terminal") is True for result in results)
+    host_fallback_zero = bool(results) and all(result.get("host_fallback_zero") is True for result in results)
     accepted_call_count = sum(int(result.get("accepted_call_count", 0)) for result in results)
     reasons = [str(result.get("reason", "")) for result in results if result.get("reason")]
     return {
         "judge_score_terminal": terminal,
+        "judge_score_host_fallback_zero": host_fallback_zero,
         "judge_score_accepted_call_count": accepted_call_count,
         "judge_score_integrity_error": "; ".join(reasons),
     }
@@ -413,15 +414,17 @@ def _validated_judge_score_integrity_metrics(
     except FileNotFoundError as exc:
         if trial.verifier_result is not None:
             raise
-        raise RuntimeError(
-            "Agentic verifier did not produce a result or a host score-integrity verdict"
-        ) from exc
+        raise RuntimeError("Agentic verifier did not produce a result or a host score-integrity verdict") from exc
 
-    if not metrics["judge_score_terminal"]:
+    if not metrics["judge_score_terminal"] and not metrics["judge_score_host_fallback_zero"]:
         reason = metrics["judge_score_integrity_error"] or "judge score was not terminal"
         raise RuntimeError(f"Agentic verifier score failed host integrity validation: {reason}")
     if trial.verifier_result is None:
         raise RuntimeError("Agentic verifier did not produce a result despite a terminal judge score")
+    if metrics["judge_score_host_fallback_zero"] and any(
+        float(reward) != 0.0 for reward in trial.verifier_result.rewards.values()
+    ):
+        raise RuntimeError("Agentic verifier host fallback verdict requires zero rewards")
     return metrics
 
 
@@ -478,10 +481,7 @@ class HarborAgentConfig(BaseResponsesAPIAgentConfig):
             and isinstance(exec_timeout, (int, float))
             and self.policy_alerts.deadline_seconds > exec_timeout
         ):
-            raise ValueError(
-                "policy_alerts.deadline_seconds cannot exceed "
-                "environment.kwargs.default_exec_timeout_s"
-            )
+            raise ValueError("policy_alerts.deadline_seconds cannot exceed environment.kwargs.default_exec_timeout_s")
         for field_name in (
             "sandbox_provider_options",
             "sandbox_path_copies",

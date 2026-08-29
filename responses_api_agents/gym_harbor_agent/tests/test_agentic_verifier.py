@@ -13,7 +13,6 @@ from harbor.environments.base import ExecResult
 from harbor.models.agent.context import AgentContext
 from harbor.models.task.config import TaskOS
 from harbor.models.trial.paths import TrialPaths
-
 from responses_api_agents.gym_harbor_agent.agentic_verifier import (
     AgenticVerifier,
     AgenticVerifierConfig,
@@ -94,6 +93,27 @@ class ResumeAfterMissingScoreJudge(FailingBeforeScoreJudge):
 
     async def resume(self, instruction: str, environment, context: AgentContext) -> None:
         self.resume_instructions.append(instruction)
+        await FakeJudge.run(self, instruction, environment, context)
+
+
+class ResumeAfterNonterminalScoreJudge(FakeJudge):
+    SUPPORTS_RESUME = True
+
+    def __init__(self, reward_path: Path, logs_dir: Path, config) -> None:
+        super().__init__(reward_path, logs_dir, config)
+        self.resume_instructions: list[str] = []
+        self.reward_existed_before_resume: bool | None = None
+
+    async def run(self, instruction: str, environment, context: AgentContext) -> None:
+        await super().run(instruction, environment, context)
+        trajectory_path = self.logs_dir / "trajectory.json"
+        trajectory = json.loads(trajectory_path.read_text())
+        trajectory["steps"].append({"tool_calls": [{"tool_call_id": "later", "function_name": "bash"}]})
+        trajectory_path.write_text(json.dumps(trajectory))
+
+    async def resume(self, instruction: str, environment, context: AgentContext) -> None:
+        self.resume_instructions.append(instruction)
+        self.reward_existed_before_resume = self.reward_path.exists()
         await FakeJudge.run(self, instruction, environment, context)
 
 
@@ -466,8 +486,51 @@ async def test_returns_zero_after_exhausting_missing_score_retries(monkeypatch, 
     assert "call score_solution exactly once" in created["judge"].instructions[1]
     assert json.loads((trial_paths.verifier_dir / "score_integrity.json").read_text()) == {
         "accepted_call_count": 0,
+        "host_fallback_zero": True,
         "reason": "judge trajectory is missing",
         "terminal": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_resumes_judge_after_nonterminal_score_on_fixed_submission(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("TEST_JUDGE_KEY", "secret-key")
+    monkeypatch.setenv("TEST_JUDGE_BASE", "https://judge.test/v1")
+    trial_paths = TrialPaths(tmp_path / "trial")
+    trial_paths.mkdir()
+    created = {}
+
+    def create_agent(config, **kwargs):
+        created["judge"] = ResumeAfterNonterminalScoreJudge(
+            trial_paths.reward_json_path,
+            kwargs["logs_dir"],
+            config,
+        )
+        return created["judge"]
+
+    monkeypatch.setattr(
+        "responses_api_agents.gym_harbor_agent.agentic_verifier.AgentFactory.create_agent_from_config",
+        create_agent,
+    )
+    config = make_config()
+    config["max_attempts"] = 2
+    verifier = AgenticVerifier(
+        task=make_task(tmp_path),
+        trial_paths=trial_paths,
+        environment=make_environment(),
+        config=config,
+    )
+
+    result = await verifier.verify()
+
+    assert result.rewards == {"reward": 0.75}
+    assert created["judge"].reward_existed_before_resume is False
+    assert len(created["judge"].resume_instructions) == 1
+    assert "nonterminal score sink" in created["judge"].resume_instructions[0]
+    assert json.loads((trial_paths.verifier_dir / "score_integrity.json").read_text()) == {
+        "accepted_call_count": 1,
+        "reason": "",
+        "terminal": True,
     }
 
 

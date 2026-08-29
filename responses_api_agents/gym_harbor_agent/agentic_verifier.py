@@ -369,8 +369,7 @@ class AgenticVerifier(BaseVerifier):
             )
 
     def _parse_rewards(self) -> dict[str, float | int]:
-        reward_relative = PurePosixPath(self.config.reward_path).relative_to(EnvironmentPaths.verifier_dir)
-        reward_path = self.trial_paths.verifier_dir.joinpath(*reward_relative.parts)
+        reward_path = self._local_reward_path()
         if not reward_path.is_file():
             raise FileNotFoundError(f"Agentic judge did not produce {self.config.reward_path}")
         raw = json.loads(reward_path.read_text())
@@ -389,6 +388,30 @@ class AgenticVerifier(BaseVerifier):
             rewards[key] = value
         return rewards
 
+    def _local_reward_path(self) -> Path:
+        reward_relative = PurePosixPath(self.config.reward_path).relative_to(EnvironmentPaths.verifier_dir)
+        return self.trial_paths.verifier_dir.joinpath(*reward_relative.parts)
+
+    def _record_host_fallback_zero(self, score_integrity: ScoreIntegrityResult) -> None:
+        """Record an auditable zero after all fixed-submission retries fail."""
+        reward_path = self._local_reward_path()
+        reward_path.parent.mkdir(parents=True, exist_ok=True)
+        reward_path.write_text(json.dumps({"reward": 0.0}, indent=2) + "\n")
+        integrity_path = self.trial_paths.verifier_dir / SCORE_INTEGRITY_FILENAME
+        integrity_path.write_text(
+            json.dumps(
+                {
+                    "terminal": False,
+                    "accepted_call_count": score_integrity.accepted_call_count,
+                    "reason": score_integrity.reason,
+                    "host_fallback_zero": True,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        )
+
     def _score_integrity(self, judge_logs_dir: Path) -> ScoreIntegrityResult:
         result = _validate_score_trajectory(judge_logs_dir / "trajectory.json")
         integrity_path = self.trial_paths.verifier_dir / SCORE_INTEGRITY_FILENAME
@@ -400,8 +423,9 @@ class AgenticVerifier(BaseVerifier):
         return (
             "Your previous verifier attempt did not produce a terminal score_solution call "
             f"({score_integrity.reason}). The policy submission is unchanged. Continue the "
-            "evaluation using any work you already completed, then call score_solution exactly "
-            "once as your final tool call."
+            "evaluation using any work you already completed. The nonterminal score sink, if "
+            "one was written, has been reset; call score_solution exactly once as your final "
+            "tool call."
         )
 
     @override
@@ -499,28 +523,29 @@ class AgenticVerifier(BaseVerifier):
                 raise run_error
             if isinstance(run_error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
                 raise run_error
-            if score_integrity.accepted_call_count != 0:
-                self.logger.error(
-                    "Rejecting ambiguous agentic judge score with reward 0: %s",
-                    score_integrity.reason,
-                )
-                return VerifierResult(rewards={"reward": 0.0})
             if attempt == self.config.max_attempts:
                 self.logger.error(
-                    "Agentic judge produced no accepted score after %d attempts; returning reward 0. "
+                    "Agentic judge produced no terminal score after %d attempts; returning an audited reward 0. "
                     "Last integrity result: %s",
                     attempt,
                     score_integrity.reason,
                 )
+                self._record_host_fallback_zero(score_integrity)
                 return VerifierResult(rewards={"reward": 0.0})
 
             self.logger.warning(
-                "Agentic judge attempt %d/%d produced no accepted score%s; retrying the fixed submission: %s",
+                "Agentic judge attempt %d/%d produced no terminal score%s; retrying the fixed submission: %s",
                 attempt,
                 self.config.max_attempts,
                 f" after {type(run_error).__name__}: {run_error}" if run_error is not None else "",
                 score_integrity.reason,
             )
+            # score_solution intentionally rejects a second successful call.
+            # OpenCode resume retains its session database but overwrites the
+            # per-command trajectory, so removing only the stale sink permits
+            # an exact-one-call retry without discarding the judge's analysis.
+            if score_integrity.accepted_call_count:
+                self._local_reward_path().unlink(missing_ok=True)
             previous_score_integrity = score_integrity
 
         raise AssertionError("unreachable")
