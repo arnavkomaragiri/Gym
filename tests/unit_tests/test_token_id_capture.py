@@ -86,8 +86,10 @@ def test_extract_token_fields_responses_shape():
         "routed_experts": None,
         "ng_generation_replica_id": None,
         "ng_generation_weight_version": None,
+        "ng_generation_weight_version_end": None,
         "ng_kv_cache_scheduler_block_size": None,
         "ng_kv_cache_hash_block_size": None,
+        "ng_kv_cache_num_cached_tokens": None,
     }
 
 
@@ -101,8 +103,10 @@ def test_extract_token_fields_keeps_execution_metadata():
                     "generation_log_probs": LPS,
                     "ng_generation_replica_id": "vllm-2",
                     "ng_generation_weight_version": 4,
+                    "ng_generation_weight_version_end": 5,
                     "ng_kv_cache_scheduler_block_size": 1056,
                     "ng_kv_cache_hash_block_size": 1056,
+                    "ng_kv_cache_num_cached_tokens": 2112,
                 }
             }
         ]
@@ -112,7 +116,9 @@ def test_extract_token_fields_keeps_execution_metadata():
     assert info is not None
     assert info["ng_generation_replica_id"] == "vllm-2"
     assert info["ng_generation_weight_version"] == 4
+    assert info["ng_generation_weight_version_end"] == 5
     assert info["ng_kv_cache_scheduler_block_size"] == 1056
+    assert info["ng_kv_cache_num_cached_tokens"] == 2112
 
 
 def test_extract_token_fields_chat_shape():

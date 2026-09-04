@@ -89,6 +89,13 @@ class SimpleResponsesAPIAgent(BaseResponsesAPIAgent, AggregateMetricsMixin, Simp
 
         return app
 
+    def _model_call_capture_enabled(self) -> bool:
+        """Whether eval model-call capture is enabled for this agent."""
+        global_config = getattr(self.server_client, "global_config_dict", None)
+        if not isinstance(global_config, Mapping):
+            return False
+        return bool(global_config.get(OBSERVABILITY_ENABLED_KEY_NAME, False))
+
     def _capture_correlation_enabled(self) -> bool:
         """Whether the per-rollout ``/ng-rollout/<id>`` correlation prefix should be applied.
 
@@ -108,7 +115,7 @@ class SimpleResponsesAPIAgent(BaseResponsesAPIAgent, AggregateMetricsMixin, Simp
         token_capture = bool(isinstance(block, Mapping) and block.get("enabled", False)) and bool(
             getattr(self.config, "token_id_capture", False)
         )
-        return bool(global_config.get(OBSERVABILITY_ENABLED_KEY_NAME, False) or token_capture)
+        return bool(self._model_call_capture_enabled() or token_capture)
 
     def rollout_id_from_run(self, body: Any) -> Optional[str]:
         """Per-rollout capture id for a run-request (its task/rollout indices).

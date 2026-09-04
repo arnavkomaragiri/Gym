@@ -44,8 +44,10 @@ TOKEN_FIELDS = (
     "routed_experts",
     "ng_generation_replica_id",
     "ng_generation_weight_version",
+    "ng_generation_weight_version_end",
     "ng_kv_cache_scheduler_block_size",
     "ng_kv_cache_hash_block_size",
+    "ng_kv_cache_num_cached_tokens",
 )
 
 # Bumped whenever a field is added or its meaning changes. Writer and reader are different
@@ -56,7 +58,9 @@ TOKEN_FIELDS = (
 #
 #   1  rollout and call identity, the token arrays, the output items and their carrier index
 #   2  generation replica/version and runtime KV-cache block metadata
-TOKEN_ENTRY_RECORD_SCHEMA_VERSION = 2
+#   3  observed cached-token count for the request
+#   4  request-end generation weight version
+TOKEN_ENTRY_RECORD_SCHEMA_VERSION = 4
 
 
 class TokenEntry(BaseModel):
@@ -88,8 +92,10 @@ class TokenEntry(BaseModel):
     routed_experts: Any | None = None
     ng_generation_replica_id: str | None = None
     ng_generation_weight_version: int | None = None
+    ng_generation_weight_version_end: int | None = None
     ng_kv_cache_scheduler_block_size: int | None = None
     ng_kv_cache_hash_block_size: int | None = None
+    ng_kv_cache_num_cached_tokens: int | None = None
     # The served response's output items (Responses shape), content preserved, token
     # arrays removed.
     output_items: list[dict] = []

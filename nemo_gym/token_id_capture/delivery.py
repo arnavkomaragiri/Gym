@@ -104,23 +104,27 @@ async def finalize_rollout_token_capture(
 
     ``source`` is where records are read from and optionally retired, and ``None`` means this
     caller is not capturing, so there is nothing to do. ``retire=False`` preserves successfully
-    consumed records for diagnostics without changing the rebuilt response. Idempotent: a rollout
-    already rebuilt carries token ids and is left alone on a second call.
+    consumed records for diagnostics without changing the rebuilt response. A native rollout that
+    already carries token ids keeps its public response unchanged, but still receives the captured
+    per-request training responses needed to preserve model-call boundaries.
 
     Never raises. A rollout whose tokens are missing or ambiguous is marked for masking, since the
     alternative is training on a trajectory with a hole in it.
 
     Returns the build (its ``rebuilt_response``, ``metrics`` and any ``error``), or ``None`` when
-    there was nothing to do: no source, or a rollout that already carries ids. A rollout that
+    there was nothing to do. A rollout that
     needed ids and could not get them returns a build with no ``rebuilt_response`` and
     ``mask_sample`` set, so a caller counting across a batch sees it as masked and unbuilt, which
     cannot be recovered from the record afterwards.
     """
-    if source is None or rollout_carries_token_ids(result):
+    if source is None:
         return None
+    carries_token_ids = rollout_carries_token_ids(result)
 
     rollout_id = maybe_rollout_id_from_run_body(result)
     if rollout_id is None:
+        if carries_token_ids:
+            return None
         # Nothing to look records up by. Usually the correlation key was not carried onto the
         # finished record.
         return _unusable(
@@ -143,6 +147,8 @@ async def finalize_rollout_token_capture(
             "It will be token-less.",
         )
     if built is None:
+        if carries_token_ids:
+            return None
         # Correlation broke between the agent and the capture middleware, such as an external
         # harness or proxy that did not preserve the /ng-rollout prefix.
         return _unusable(
@@ -154,8 +160,8 @@ async def finalize_rollout_token_capture(
         )
 
     projected = built["rebuilt_response"]
-    training_responses = built.get("rebuilt_responses") or []
-    if projected is not None:
+    training_responses = built.get("rebuilt_responses") or [] if not built.get(MASK_SAMPLE_KEY) else []
+    if projected is not None and not carries_token_ids:
         if isinstance(result.get("response"), dict):
             result["response"]["output"] = projected["output"]
         else:
@@ -169,7 +175,7 @@ async def finalize_rollout_token_capture(
     record_metrics = dict(built.get("metrics") or {})
     if built.get("error"):
         record_metrics["error"] = built["error"]
-    if built.get(MASK_SAMPLE_KEY):
+    if built.get(MASK_SAMPLE_KEY) and not carries_token_ids:
         # One location, at the top of the record, where a consumer finds it without knowing this
         # feature exists. The metrics dict keeps the reasons, not the verdict.
         result[MASK_SAMPLE_KEY] = True
@@ -178,6 +184,8 @@ async def finalize_rollout_token_capture(
             "it is marked for masking rather than trained on.",
             stacklevel=2,
         )
+    elif built.get(MASK_SAMPLE_KEY):
+        record_metrics["used_native_token_fallback"] = True
     result[TOKEN_CAPTURE_KEY] = record_metrics
 
     # Retire on consume. Rollouts record hundreds of KB each and a store appends, so keeping

@@ -392,8 +392,10 @@ def project_chain_to_output_items(chain: Chain) -> list[dict]:
             for field in (
                 "ng_generation_replica_id",
                 "ng_generation_weight_version",
+                "ng_generation_weight_version_end",
                 "ng_kv_cache_scheduler_block_size",
                 "ng_kv_cache_hash_block_size",
+                "ng_kv_cache_num_cached_tokens",
             ):
                 value = getattr(entry, field)
                 if value is not None:

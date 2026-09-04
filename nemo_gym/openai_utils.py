@@ -115,8 +115,10 @@ class TokenIDLogProbMixin(BaseModel):
     routed_experts: Optional[RoutedExperts] = None
     ng_generation_replica_id: Optional[str] = None
     ng_generation_weight_version: Optional[int] = None
+    ng_generation_weight_version_end: Optional[int] = None
     ng_kv_cache_scheduler_block_size: Optional[int] = None
     ng_kv_cache_hash_block_size: Optional[int] = None
+    ng_kv_cache_num_cached_tokens: Optional[int] = None
 
 
 class TokenIDLogProbTypedDictMixin(TypedDict):
@@ -126,8 +128,10 @@ class TokenIDLogProbTypedDictMixin(TypedDict):
     routed_experts: NotRequired[RoutedExperts]
     ng_generation_replica_id: NotRequired[str]
     ng_generation_weight_version: NotRequired[int]
+    ng_generation_weight_version_end: NotRequired[int]
     ng_kv_cache_scheduler_block_size: NotRequired[int]
     ng_kv_cache_hash_block_size: NotRequired[int]
+    ng_kv_cache_num_cached_tokens: NotRequired[int]
 
 
 ########################################
@@ -427,8 +431,10 @@ class NeMoGymChatCompletionMessage(ChatCompletionMessage):
     reasoning: Optional[str] = None
     ng_generation_replica_id: Optional[str] = None
     ng_generation_weight_version: Optional[int] = None
+    ng_generation_weight_version_end: Optional[int] = None
     ng_kv_cache_scheduler_block_size: Optional[int] = None
     ng_kv_cache_hash_block_size: Optional[int] = None
+    ng_kv_cache_num_cached_tokens: Optional[int] = None
 
 
 class NeMoGymChatCompletionMessageForTraining(NeMoGymChatCompletionMessage, TokenIDLogProbMixin):

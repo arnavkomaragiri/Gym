@@ -1742,10 +1742,10 @@ class TestFinalizeRolloutTokenCapture:
         }
 
     @staticmethod
-    def _capture(store: TokenCaptureStore) -> None:
+    def _capture(store: TokenCaptureStore, rollout_id: str = "0-0") -> None:
         store.append(
             TokenEntry(
-                rollout_id="0-0",
+                rollout_id=rollout_id,
                 model_call_id="c1",
                 prompt_token_ids=[1, 2, 3],
                 generation_token_ids=[4, 5],
@@ -1780,39 +1780,69 @@ class TestFinalizeRolloutTokenCapture:
         assert result["response"]["output"][0]["generation_token_ids"] == [4, 5]
         assert len(store.read_entries("0-0")) == 1
 
-    async def test_a_rollout_that_already_has_token_ids_is_left_alone(self, tmp_path: Path) -> None:
-        """A native agent's ids are what the policy sampled. A rebuild could differ, and
-        overwriting them would train on the difference silently."""
+    async def test_a_rollout_that_already_has_token_ids_keeps_them_and_attaches_calls(self, tmp_path: Path) -> None:
+        """Native output remains authoritative while capture supplies call boundaries."""
         store = TokenCaptureStore(tmp_path)
         self._capture(store)
         native = [{"type": "message", "role": "assistant", "generation_token_ids": [9, 9], "content": []}]
         result = self._record(output=native)
 
         with warnings.catch_warnings():
-            warnings.simplefilter("error")  # and it must not be reported as a problem
-            assert await finalize_rollout_token_capture(result, store, retire=True) is None
+            warnings.simplefilter("error")
+            built = await finalize_rollout_token_capture(result, store, retire=True)
 
         assert result["response"]["output"] == native
-        assert TOKEN_CAPTURE_KEY not in result
-        assert len(store.read_entries("0-0")) == 1  # not consumed: they were not this rollout's
+        assert result["_ng_training_responses"][0]["output"][0]["generation_token_ids"] == [4, 5]
+        assert built is not None
+        assert len(store.read_entries("0-0")) == 0
 
     async def test_native_and_external_rollouts_are_handled_in_one_batch(self, tmp_path: Path) -> None:
         """Mixed training: both kinds go through the same call and each gets what it needs."""
         store = TokenCaptureStore(tmp_path)
         self._capture(store)
+        self._capture(store, "1-0")
         native = self._record(
             output=[{"type": "message", "role": "assistant", "generation_token_ids": [7], "content": []}]
         )
+        native[TASK_INDEX_KEY_NAME] = 1
         external = self._record()
 
         with warnings.catch_warnings():
             warnings.simplefilter("error")
-            assert await finalize_rollout_token_capture(native, store, retire=True) is None
+            native_built = await finalize_rollout_token_capture(native, store, retire=True)
         built = await finalize_rollout_token_capture(external, store, retire=True)
 
         assert native["response"]["output"][0]["generation_token_ids"] == [7]
+        assert native_built is not None
         assert external["response"]["output"][0]["generation_token_ids"] == [4, 5]
         assert built is not None
+
+    async def test_bad_capture_does_not_mask_native_token_output(self, tmp_path: Path) -> None:
+        store = TokenCaptureStore(tmp_path)
+        self._capture(store)
+        entry = store.read_entries("0-0")[0]
+        entry.generation_log_probs = [-0.1]
+        await store.drop("0-0")
+        store.append(entry)
+        native = self._record(
+            output=[
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "generation_token_ids": [7],
+                    "content": [],
+                }
+            ]
+        )
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            built = await finalize_rollout_token_capture(native, store, retire=True)
+
+        assert built is not None and built[MASK_SAMPLE_KEY]
+        assert MASK_SAMPLE_KEY not in native
+        assert "_ng_training_responses" not in native
+        assert native[TOKEN_CAPTURE_KEY]["used_native_token_fallback"] is True
 
     async def test_a_second_call_is_a_no_op(self, tmp_path: Path) -> None:
         """Idempotent: the first call leaves ids on the rollout, which the second one reads."""
