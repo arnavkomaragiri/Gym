@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import argparse
 import json
 import sys
+from collections.abc import Iterable
 from pathlib import Path
-
-from datasets import load_dataset
 
 
 _OPEN_ENDED = {
@@ -98,9 +99,33 @@ def format_row(row: dict, boxed_letter_format: bool = False) -> dict:
     }
 
 
+def _iter_rows(input_jsonl: Path | None, split: str) -> Iterable[dict]:
+    if input_jsonl is None:
+        from datasets import load_dataset  # noqa: PLC0415
+
+        yield from load_dataset("futurehouse/ether0-benchmark", split=split)
+        return
+
+    with input_jsonl.open() as source:
+        for line_number, line in enumerate(source, start=1):
+            if not line.strip():
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(f"Invalid JSON on {input_jsonl}:{line_number}: {error}") from error
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Download and prepare ether0-benchmark for NeMo Gym")
     parser.add_argument("--output", required=True, help="Output JSONL path")
+    parser.add_argument(
+        "--input-jsonl",
+        type=Path,
+        default=None,
+        help="Read raw Ether0 rows from a local JSONL instead of Hugging Face",
+    )
+    parser.add_argument("--split", default="test", help="Hugging Face split used when --input-jsonl is omitted")
     parser.add_argument("--problem-types", nargs="*", default=None, help="Problem type prefixes to include")
     parser.add_argument("--limit", type=int, default=None, help="Max rows to output")
     parser.add_argument(
@@ -110,14 +135,12 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    ds = load_dataset("futurehouse/ether0-benchmark", split="test")
-
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     count = 0
     with open(output_path, "w") as fout:
-        for row in ds:
+        for row in _iter_rows(args.input_jsonl, args.split):
             if args.problem_types:
                 pt = row.get("problem_type", "")
                 if not any(pt.startswith(p) for p in args.problem_types):
@@ -135,6 +158,7 @@ def main() -> None:
 
 
 # python scripts/prepare_ether0.py --output data/val.jsonl
+# python scripts/prepare_ether0.py --input-jsonl /path/to/train.jsonl --output data/train.jsonl
 # python scripts/prepare_ether0.py --output data/example.jsonl --limit 5
 # python scripts/prepare_ether0.py --output data/val_reactions.jsonl --problem-types reaction-prediction retro-synthesis
 # python scripts/prepare_ether0.py --output data/val_boxed_letter.jsonl --boxed-letter-format

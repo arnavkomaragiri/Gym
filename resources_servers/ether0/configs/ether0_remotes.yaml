@@ -1,0 +1,14 @@
+ether0:
+  resources_servers:
+    ether0:
+      # The legacy model stack runs in a Python 3.12 child managed by this
+      # resources server. Paths are supplied by the launcher and remain
+      # outside the code snapshot.
+      num_workers: 1
+      remotes:
+        python_executable: ${oc.env:ETHER0_REMOTES_PYTHON}
+        model_path: ${oc.env:ETHER0_MOLTRANS_MODEL_PATH}
+        runtime_home: ${oc.env:ETHER0_REMOTES_RUNTIME_HOME}
+        startup_timeout_seconds: 600
+        shutdown_timeout_seconds: 10
+        cpu_threads: 4

@@ -6,6 +6,9 @@ ether0:
       verified: false
       description: ether0 chemistry benchmark verifiers
       value: Evaluate chemistry knowledge and reasoning with ether0 benchmark
+      max_concurrent_verifications: 32
+      # Set this block for datasets containing oracle-solubility or retro-synthesis.
+      remotes: null
 ether0_simple_agent:
   responses_api_agents:
     simple_agent:

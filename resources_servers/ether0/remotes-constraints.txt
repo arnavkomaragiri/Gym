@@ -1,0 +1,6 @@
+# Compatibility pins validated with Python 3.12 and the Ether0 model assets.
+keras==3.15.1
+numpy==2.5.2
+pyonmttok==1.38.1
+tensorflow==2.21.0
+torch==2.5.1
