@@ -12,3 +12,5 @@ ether0:
         startup_timeout_seconds: 600
         shutdown_timeout_seconds: 10
         cpu_threads: 4
+        solubility_max_batch_size: 32
+        solubility_batch_wait_milliseconds: 10

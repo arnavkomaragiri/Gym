@@ -12,11 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import remotes_app
 from fastapi.testclient import TestClient
+
+
+_REMOTES_ENV = {
+    "ETHER0_REMOTES_API_TOKEN": "test-token",
+    "ETHER0_REMOTES_SOLUBILITY_MAX_BATCH_SIZE": "32",
+    "ETHER0_REMOTES_SOLUBILITY_BATCH_WAIT_MILLISECONDS": "10",
+}
 
 
 def test_models_are_shared_across_requests() -> None:
@@ -25,11 +33,11 @@ def test_models_are_shared_across_requests() -> None:
     purchasability = MagicMock()
     purchasability.run.return_value = True
     solubility = MagicMock()
-    solubility.run.return_value = np.array([1.0, 0.1, 0.2], dtype=np.float32)
+    solubility.run_batch.return_value = [np.array([1.0, 0.1, 0.2], dtype=np.float32)]
     headers = {"Authorization": "Bearer test-token"}
 
     with (
-        patch.dict("os.environ", {"ETHER0_REMOTES_API_TOKEN": "test-token"}),
+        patch.dict("os.environ", _REMOTES_ENV),
         patch.object(
             remotes_app,
             "_build_models",
@@ -47,10 +55,58 @@ def test_models_are_shared_across_requests() -> None:
     build_models.assert_called_once()
     assert transformer.run.call_count == 2
     purchasability.run.assert_called_once_with("CCO")
-    solubility.run.assert_called_once_with("CCO")
+    solubility.run_batch.assert_called_once_with(["CCO"])
+
+
+def test_solubility_requests_are_batched() -> None:
+    solubility = MagicMock()
+    solubility.run_batch.side_effect = lambda values: [
+        np.array([float(index), 0.1, 0.2], dtype=np.float32) for index, _ in enumerate(values)
+    ]
+
+    async def run_requests() -> list[np.ndarray]:
+        batcher = remotes_app.SolubilityBatcher(
+            solubility,
+            max_batch_size=4,
+            batch_wait_seconds=0.05,
+        )
+        await batcher.start()
+        try:
+            return await asyncio.gather(
+                batcher.predict("CC"),
+                batcher.predict("CCC"),
+                batcher.predict("CCCC"),
+            )
+        finally:
+            await batcher.close()
+
+    predictions = asyncio.run(run_requests())
+
+    solubility.run_batch.assert_called_once_with(["CC", "CCC", "CCCC"])
+    assert [prediction[0] for prediction in predictions] == [0.0, 1.0, 2.0]
+
+
+def test_singleton_solubility_batch_preserves_batch_axis() -> None:
+    member = MagicMock()
+    member.return_value.numpy.return_value = np.array(
+        [[1.0, 0.1], [1.0, 0.1]],
+        dtype=np.float32,
+    )
+    solubility = remotes_app.SharedSolubility.__new__(remotes_app.SharedSolubility)
+    solubility._model = MagicMock()
+    solubility._model.model.models = [member]
+
+    prediction = solubility._predict_batch([[1, 2, 3]])
+
+    assert len(prediction) == 1
+    np.testing.assert_array_equal(
+        prediction[0],
+        np.array([1.0, 0.1, 0.0], dtype=np.float32),
+    )
+    assert member.call_args.args[0].shape == (2, 3)
 
 
 def test_authentication_is_required() -> None:
-    with patch.dict("os.environ", {"ETHER0_REMOTES_API_TOKEN": "test-token"}):
+    with patch.dict("os.environ", _REMOTES_ENV):
         response = TestClient(remotes_app.app).get("/health")
     assert response.status_code == 401

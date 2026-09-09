@@ -16,8 +16,10 @@
 
 import asyncio
 import io
+import logging
 import os
 import secrets
+import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -32,6 +34,9 @@ from pydantic import BaseModel
 
 
 auth_scheme = HTTPBearer()
+logger = logging.getLogger(__name__)
+
+SolubilityPrediction = npt.NDArray[np.float32] | Literal[False]
 
 
 def validate_token(
@@ -102,37 +107,177 @@ class SharedSolubility:
 
         self._model = KDESol()
 
-    def _predict(self, smiles: str) -> npt.NDArray[np.float32] | None:
-        encoded = self._model.stoi(self._model.encoder(smiles))
-        if encoded is None:
-            return None
-        batch = np.array([encoded, encoded])
+    def _predict_batch(
+        self,
+        encoded_smiles: list[list[int]],
+    ) -> list[npt.NDArray[np.float32]]:
+        batch = np.asarray(encoded_smiles)
+        singleton_batch = len(batch) == 1
+        if singleton_batch:
+            # KDESol's SqueezeLayer drops the batch axis for B=1.
+            batch = np.repeat(batch, 2, axis=0)
         predictions = np.stack(
             [member(batch, training=False).numpy() for member in self._model.model.models],
             axis=0,
         )
-        mean = np.mean(predictions, axis=0)[0]
-        standard_deviation = np.std(predictions, axis=0)[0]
-        return np.array(
-            [mean[0], mean[1], standard_deviation[0]],
-            dtype=np.float32,
-        )
+        means = np.mean(predictions, axis=0)
+        standard_deviations = np.std(predictions, axis=0)
+        if singleton_batch:
+            means = means[:1]
+            standard_deviations = standard_deviations[:1]
+        return [
+            np.array(
+                [mean[0], mean[1], standard_deviation[0]],
+                dtype=np.float32,
+            )
+            for mean, standard_deviation in zip(means, standard_deviations, strict=True)
+        ]
 
-    def run(self, smiles: str) -> npt.NDArray[np.float32] | Literal[False]:
+    def _encode(self, smiles: str) -> list[int] | None:
+        return self._model.stoi(self._model.encoder(smiles))
+
+    def run_batch(self, smiles_batch: list[str]) -> list[SolubilityPrediction]:
         from rdkit import Chem  # noqa: PLC0415
 
-        molecule = Chem.MolFromSmiles(smiles)
-        if molecule is None:
-            return False
-        canonical_smiles = Chem.MolToSmiles(
-            molecule,
-            canonical=True,
-            isomericSmiles=False,
+        results: list[SolubilityPrediction] = [False] * len(smiles_batch)
+        valid_indices: list[int] = []
+        encoded_smiles: list[list[int]] = []
+        for index, smiles in enumerate(smiles_batch):
+            molecule = Chem.MolFromSmiles(smiles)
+            if molecule is None:
+                continue
+            canonical_smiles = Chem.MolToSmiles(
+                molecule,
+                canonical=True,
+                isomericSmiles=False,
+            )
+            encoded = self._encode(canonical_smiles)
+            if encoded is None:
+                encoded = self._encode(smiles)
+            if encoded is None:
+                continue
+            valid_indices.append(index)
+            encoded_smiles.append(encoded)
+
+        if encoded_smiles:
+            predictions = self._predict_batch(encoded_smiles)
+            for index, prediction in zip(valid_indices, predictions, strict=True):
+                results[index] = prediction
+        return results
+
+    def run(self, smiles: str) -> SolubilityPrediction:
+        return self.run_batch([smiles])[0]
+
+
+@dataclass
+class _SolubilityWorkItem:
+    smiles: str
+    future: asyncio.Future[SolubilityPrediction]
+    queued_at: float
+
+
+class SolubilityBatcher:
+    """Coalesce independent requests into bounded KDESol inference batches."""
+
+    def __init__(
+        self,
+        model: SharedSolubility,
+        *,
+        max_batch_size: int,
+        batch_wait_seconds: float,
+    ) -> None:
+        self._model = model
+        self._max_batch_size = max_batch_size
+        self._batch_wait_seconds = batch_wait_seconds
+        self._queue: asyncio.Queue[_SolubilityWorkItem | None] = asyncio.Queue()
+        self._worker: asyncio.Task[None] | None = None
+        self._batch_count = 0
+        self._request_count = 0
+
+    async def start(self) -> None:
+        if self._worker is not None:
+            raise RuntimeError("Solubility batcher is already running")
+        self._worker = asyncio.create_task(self._run())
+
+    async def close(self) -> None:
+        worker = self._worker
+        if worker is None:
+            return
+        await self._queue.put(None)
+        await worker
+        self._worker = None
+
+    async def predict(self, smiles: str) -> SolubilityPrediction:
+        if self._worker is None:
+            raise RuntimeError("Solubility batcher is not running")
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[SolubilityPrediction] = loop.create_future()
+        await self._queue.put(
+            _SolubilityWorkItem(
+                smiles=smiles,
+                future=future,
+                queued_at=loop.time(),
+            )
         )
-        prediction = self._predict(canonical_smiles)
-        if prediction is None:
-            prediction = self._predict(smiles)
-        return prediction if prediction is not None else False
+        return await future
+
+    async def _collect_batch(
+        self,
+        first_item: _SolubilityWorkItem,
+    ) -> tuple[list[_SolubilityWorkItem], bool]:
+        batch = [first_item]
+        should_stop = False
+        deadline = asyncio.get_running_loop().time() + self._batch_wait_seconds
+        while len(batch) < self._max_batch_size:
+            timeout = deadline - asyncio.get_running_loop().time()
+            if timeout <= 0:
+                break
+            try:
+                item = await asyncio.wait_for(self._queue.get(), timeout=timeout)
+            except TimeoutError:
+                break
+            if item is None:
+                should_stop = True
+                break
+            batch.append(item)
+        return batch, should_stop
+
+    async def _run(self) -> None:
+        while True:
+            first_item = await self._queue.get()
+            if first_item is None:
+                return
+            batch, should_stop = await self._collect_batch(first_item)
+            started_at = time.monotonic()
+            try:
+                predictions = await asyncio.to_thread(
+                    self._model.run_batch,
+                    [item.smiles for item in batch],
+                )
+            except Exception as error:
+                for item in batch:
+                    if not item.future.done():
+                        item.future.set_exception(error)
+            else:
+                for item, prediction in zip(batch, predictions, strict=True):
+                    if not item.future.done():
+                        item.future.set_result(prediction)
+
+            self._batch_count += 1
+            self._request_count += len(batch)
+            if self._batch_count == 1 or self._batch_count % 100 == 0:
+                oldest_queue_seconds = max(0.0, started_at - batch[0].queued_at)
+                logger.info(
+                    "Ether0 solubility batches=%d requests=%d last_batch=%d "
+                    "oldest_queue_seconds=%.3f inference_seconds=%.3f",
+                    self._batch_count,
+                    self._request_count,
+                    len(batch),
+                    oldest_queue_seconds,
+                    time.monotonic() - started_at,
+                )
+            if should_stop:
+                return
 
 
 class PurchasabilityModel(Protocol):
@@ -146,7 +291,7 @@ class RemotesModels:
     solubility: SharedSolubility
     transformer_lock: asyncio.Lock
     purchasability_lock: asyncio.Lock
-    solubility_lock: asyncio.Lock
+    solubility_batcher: SolubilityBatcher
 
 
 def _build_models() -> tuple[SharedMolecularTransformer, PurchasabilityModel, SharedSolubility]:
@@ -160,20 +305,35 @@ def _models_with_locks(
     loaded_models: tuple[SharedMolecularTransformer, PurchasabilityModel, SharedSolubility],
 ) -> RemotesModels:
     transformer, purchasability, solubility = loaded_models
+    max_batch_size = int(os.environ["ETHER0_REMOTES_SOLUBILITY_MAX_BATCH_SIZE"])
+    batch_wait_milliseconds = float(os.environ["ETHER0_REMOTES_SOLUBILITY_BATCH_WAIT_MILLISECONDS"])
+    if max_batch_size < 1:
+        raise ValueError("ETHER0_REMOTES_SOLUBILITY_MAX_BATCH_SIZE must be positive")
+    if batch_wait_milliseconds < 0:
+        raise ValueError("ETHER0_REMOTES_SOLUBILITY_BATCH_WAIT_MILLISECONDS must be non-negative")
     return RemotesModels(
         transformer=transformer,
         purchasability=purchasability,
         solubility=solubility,
         transformer_lock=asyncio.Lock(),
         purchasability_lock=asyncio.Lock(),
-        solubility_lock=asyncio.Lock(),
+        solubility_batcher=SolubilityBatcher(
+            solubility,
+            max_batch_size=max_batch_size,
+            batch_wait_seconds=batch_wait_milliseconds / 1000.0,
+        ),
     )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.models = _models_with_locks(await asyncio.to_thread(_build_models))
-    yield
+    models = _models_with_locks(await asyncio.to_thread(_build_models))
+    app.state.models = models
+    await models.solubility_batcher.start()
+    try:
+        yield
+    finally:
+        await models.solubility_batcher.close()
 
 
 app = FastAPI(
@@ -245,11 +405,7 @@ async def compute_solubility_endpoint(
             detail="Only single molecules are supported",
         )
     models: RemotesModels = app.state.models
-    async with models.solubility_lock:
-        prediction: npt.NDArray[np.float32] | Literal[False] = await asyncio.to_thread(
-            models.solubility.run,
-            request.smiles,
-        )
+    prediction = await models.solubility_batcher.predict(request.smiles)
     if prediction is False:
         return {"error": "Solubility prediction failed."}
     mean, aleatoric_uncertainty, epistemic_uncertainty = prediction.tolist()

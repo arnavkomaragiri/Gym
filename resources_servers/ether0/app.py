@@ -98,6 +98,16 @@ class Ether0RemotesConfig(BaseModel):
         gt=0,
         description="Thread cap applied to Torch, TensorFlow, BLAS, and OpenMP",
     )
+    solubility_max_batch_size: int = Field(
+        default=32,
+        gt=0,
+        description="Maximum number of solubility requests evaluated in one model batch",
+    )
+    solubility_batch_wait_milliseconds: float = Field(
+        default=10.0,
+        ge=0,
+        description="Maximum time to collect concurrent solubility requests into a batch",
+    )
 
 
 class Ether0ResourcesServerConfig(BaseResourcesServerConfig):
@@ -211,6 +221,8 @@ class Ether0ResourcesServer(SimpleResourcesServer):
                 "PYTHONUNBUFFERED": "1",
                 "TF_NUM_INTEROP_THREADS": str(config.cpu_threads),
                 "TF_NUM_INTRAOP_THREADS": str(config.cpu_threads),
+                "ETHER0_REMOTES_SOLUBILITY_MAX_BATCH_SIZE": str(config.solubility_max_batch_size),
+                "ETHER0_REMOTES_SOLUBILITY_BATCH_WAIT_MILLISECONDS": str(config.solubility_batch_wait_milliseconds),
             }
         )
         try:
